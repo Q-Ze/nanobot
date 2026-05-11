@@ -17,6 +17,7 @@ from nanobot.privacy.decider import DeciderInputs, ExecutionDecider
 from nanobot.privacy.detector import PrivacyEntityDetector
 from nanobot.privacy.local_model import LocalModelBackend
 from nanobot.privacy.local_model import get_default as get_default_backend
+from nanobot.privacy.semantic_detector import LLMSemanticDetector, is_available_backend
 from nanobot.privacy.types import (
     AuditView,
     ChannelCapabilities,
@@ -67,14 +68,25 @@ class GateKeeper:
     ) -> "GateKeeper":
         """Build a GateKeeper from PrivacyConfig.
 
-        Pass ``semantic_detector`` to plug in a local-LM-backed second pass
+        Pass ``semantic_detector`` to plug in a custom second-pass detector
         (must implement :class:`nanobot.privacy.detector.SemanticDetector`).
         Pass ``local_model`` to override the process-default
         :class:`LocalModelBackend` for this gate.
 
-        M1.5 defaults to NoopSemanticDetector + NullLocalModel — both are
-        no-ops, so K_DECOY / METRIC_DP / SIMPLE remain unavailable.
+        When ``semantic_detector`` is omitted and the local-model backend is
+        available, an :class:`LLMSemanticDetector` is auto-wired against it.
+        That way ``privacy.local_model`` doubles as the on-switch for
+        LM-based recall improvements without any extra plumbing.
         """
+        # Auto-wire the LM-backed semantic detector when a usable backend
+        # is present and the caller didn't supply one explicitly. The
+        # `is_available_backend` helper handles None / NullLocalModel /
+        # backends whose is_available() raises.
+        if semantic_detector is None and is_available_backend(local_model):
+            semantic_detector = LLMSemanticDetector(
+                backend=local_model,
+                risk_class_overrides=config.risk_class_overrides,
+            )
         detector = PrivacyEntityDetector(
             risk_class_overrides=config.risk_class_overrides,
             regex_extensions=config.regex_extensions,

@@ -8,6 +8,7 @@ Local-model abstraction is defined; no backend is wired yet.
 from nanobot.privacy import local_model
 from nanobot.privacy.gate import GateKeeper
 from nanobot.privacy.local_model import LocalModelBackend, NullLocalModel
+from nanobot.privacy.semantic_detector import LLMSemanticDetector
 from nanobot.privacy.types import (
     AllowedPathSet,
     AuditView,
@@ -30,6 +31,7 @@ __all__ = [
     "EntityType",
     "ExecutionPath",
     "GateKeeper",
+    "LLMSemanticDetector",
     "LocalModelBackend",
     "NullLocalModel",
     "PathSource",

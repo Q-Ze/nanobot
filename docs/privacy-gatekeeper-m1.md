@@ -348,23 +348,28 @@ Rules clients should rely on:
 - **Anonymize and forward.** Any MEDIUM/HIGH entity blocks the message in M1.
   This is intentional fail-closed behavior pending the K-decoy (M2) and
   Metric-DP (M3) transformers.
-- **Built-in semantic (small-model) detection.** M1 ships a regex layer
-  only; the `SemanticDetector` slot is a no-op. Two ways to fill it:
-  - **Wait for M2/M3** — a packaged local-LM-based detector is on the
-    roadmap. The `privacy.local_model` config field is reserved for it.
-  - **Plug your own now**: implement the protocol and inject it:
+- **Built-in semantic (small-model) detection.** Auto-wired when
+  `privacy.local_model` resolves to a usable backend — the GateKeeper
+  builds an `LLMSemanticDetector` against it and runs it as the
+  detector's second pass. The LM is asked for strict JSON and any
+  reported value not actually present in the message is dropped
+  (hallucination guard). Timeout, backend failure, or unparseable
+  output → semantic layer returns nothing and the regex hits stand on
+  their own (fail-closed at the layer boundary).
+
+  To plug a fully custom detector instead, implement the
+  `SemanticDetector` protocol and pass it explicitly:
 
     ```python
     from nanobot.privacy import GateKeeper
     from nanobot.privacy.detector import SemanticDetector
 
-    class MySmallLM:
+    class MyCustomDetector:
         async def detect(self, raw_message, regex_hits):
-            # call your local model here (Ollama, LM Studio, llama.cpp, …)
-            # return a list of nanobot.privacy.types.DetectedEntity
+            # call your own classifier here
             return []
 
-    gate = GateKeeper.from_config(config.privacy, semantic_detector=MySmallLM())
+    gate = GateKeeper.from_config(config.privacy, semantic_detector=MyCustomDetector())
     ```
 - **Interactive confirmation in non-CLI channels.** CLI and **WebSocket**
   are wired (see §4.0 for CLI; §4.6 below for the WebSocket wire
