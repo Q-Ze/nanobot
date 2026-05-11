@@ -273,6 +273,64 @@ nanobot --config /tmp/privacy_demo.json chat "test my key sk-ant-test123 please"
 tail -1 ~/.nanobot/privacy_audit/audit-*.jsonl | python -m json.tool
 ```
 
+### 4.6 WebSocket wire protocol (for custom clients / WebUI authors)
+
+When `privacy.enabled = true` and a WebSocket client is subscribed to a
+chat, the GateKeeper asks for confirmation by broadcasting an outbound
+envelope on the existing connection. The client replies with an inbound
+envelope; AgentLoop's turn is suspended until either the reply arrives or
+the configured timeout expires (default 120 s for WebSocket, fail-closed
+to BLOCKED on timeout).
+
+**Server → client** (outbound event, alongside `message` / `delta` etc.):
+
+```jsonc
+{
+  "event": "privacy_confirmation",
+  "chat_id": "<chat>",
+  "confirmation_id": "<32-char hex>",
+  "path": "blocked",                       // system-recommended path
+  "reason": "hard_secret:credential",       // machine-friendly explanation
+  "allowed": ["blocked"],                   // user may only choose from this set
+  "entities": [
+    {
+      "type": "credential",
+      "risk_class": "catastrophic",
+      "linkability": "single_use",
+      "value": "sk-xsadsafsgdrghr",         // user's own data — show in the UI
+      "span": [21, 38],
+      "confidence": 1.0,
+      "detector": "regex:sk_prefixed"
+    }
+  ]
+}
+```
+
+**Client → server** (inbound envelope, sharing the same channel):
+
+```jsonc
+{
+  "type": "privacy_confirmation_reply",
+  "confirmation_id": "<32-char hex>",       // must echo the prompt's id
+  "chosen_path": "blocked"                   // or null to cancel the message
+}
+```
+
+Rules clients should rely on:
+
+- Any value in `chosen_path` that is **not** in the prompt's `allowed`
+  list is silently overridden to the system recommendation
+  (`violation_attempt` is recorded in the audit log). This is
+  intentional — the server does not reveal *why* a choice was rejected
+  to avoid leaking floor-rule structure to attackers.
+- `chosen_path: null` means "cancel this turn" (the message is treated
+  as BLOCKED with a cancellation refusal).
+- Replies with an **unknown** `confirmation_id` are silently ignored
+  (same reasoning). Malformed envelopes (missing `confirmation_id`,
+  unrecognized `chosen_path` string) generate an `error` event back.
+- The server cancels every pending confirmation when the channel stops,
+  so clients should treat connection loss as an implicit cancel.
+
 ---
 
 ## 5. Limits & roadmap
@@ -300,12 +358,13 @@ tail -1 ~/.nanobot/privacy_audit/audit-*.jsonl | python -m json.tool
 
     gate = GateKeeper.from_config(config.privacy, semantic_detector=MySmallLM())
     ```
-- **Interactive confirmation in non-CLI channels.** CLI is wired (see §4.0).
-  Telegram, Discord, Slack, WebSocket, WebUI all fall back to
+- **Interactive confirmation in non-CLI channels.** CLI and **WebSocket**
+  are wired (see §4.0 for CLI; §4.6 below for the WebSocket wire
+  protocol). Telegram, Discord, Slack all fall back to
   `forced_conservative` until each implements
   `BaseChannel.privacy_capabilities()` with real `send_confirmation` /
-  `await_confirmation_reply` callbacks. M2 will ship the WebSocket/WebUI
-  implementation.
+  `await_confirmation_reply` callbacks. The WebUI frontend rendering on
+  top of the WebSocket protocol is a follow-up PR.
 - **Tool-output filtering.** GateKeeper only inspects the user's inbound
   message. Filesystem reads, MCP tool outputs, etc. are not scanned. M4 adds
   catastrophic-entity scanning on outbound tool results.

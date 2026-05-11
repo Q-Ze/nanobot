@@ -42,6 +42,7 @@ from nanobot.utils.media_decode import (
 )
 
 if TYPE_CHECKING:
+    from nanobot.privacy.types import ChannelCapabilities
     from nanobot.session.manager import SessionManager
 
 
@@ -419,6 +420,12 @@ class WebSocketChannel(BaseChannel):
     name = "websocket"
     display_name = "WebSocket"
 
+    # Privacy GateKeeper: WS clients can render an interactive confirmation
+    # prompt and post back a reply, so this channel advertises support. The
+    # actual send/await callbacks are wired in __init__ via privacy_capabilities().
+    privacy_supports_interactive_confirm = True
+    privacy_confirmation_max_latency_seconds = 120
+
     def __init__(
         self,
         config: Any,
@@ -452,6 +459,13 @@ class WebSocketChannel(BaseChannel):
         # file, nothing else. The secret regenerates on restart so links
         # become self-expiring (callers just refresh the session list).
         self._media_secret: bytes = secrets.token_bytes(32)
+        # Privacy GateKeeper pending confirmations:
+        #   confirmation_id -> Future resolved by the client's
+        #   "privacy_confirmation_reply" envelope.
+        # ConfirmationGate enforces the overall timeout; the Future is only
+        # cancelled if the confirmation never arrives before timeout, or
+        # never resolved if the chat disconnects (Future is GC'd by then).
+        self._pending_confirmations: dict[str, asyncio.Future[Any]] = {}
 
     # -- Subscription bookkeeping -------------------------------------------
 
@@ -1387,6 +1401,9 @@ class WebSocketChannel(BaseChannel):
                 metadata=metadata,
             )
             return
+        if t == "privacy_confirmation_reply":
+            await self._handle_privacy_confirmation_reply(connection, envelope)
+            return
         await self._send_event(connection, "error", detail=f"unknown type: {t!r}")
 
     async def stop(self) -> None:
@@ -1406,6 +1423,120 @@ class WebSocketChannel(BaseChannel):
         self._conn_default.clear()
         self._issued_tokens.clear()
         self._api_tokens.clear()
+        # Cancel any pending privacy-confirmation futures so awaiting AgentLoop
+        # turns wake up immediately (with an asyncio.CancelledError that
+        # ConfirmationGate maps to a fail-closed BLOCKED).
+        for fut in self._pending_confirmations.values():
+            if not fut.done():
+                fut.cancel()
+        self._pending_confirmations.clear()
+
+    # -- Privacy GateKeeper bridge ------------------------------------------
+
+    def privacy_capabilities(self) -> "ChannelCapabilities":
+        from nanobot.privacy.types import ChannelCapabilities
+
+        return ChannelCapabilities(
+            supports_interactive_confirm=True,
+            confirmation_max_latency_seconds=self.privacy_confirmation_max_latency_seconds,
+            send_confirmation=self._send_privacy_confirmation,
+            await_confirmation_reply=self._await_privacy_confirmation_reply,
+        )
+
+    async def _send_privacy_confirmation(self, chat_id: str, prompt: Any) -> None:
+        """Broadcast a `privacy_confirmation` envelope to every subscriber.
+
+        ``prompt`` is a :class:`nanobot.privacy.types.ConfirmationPrompt`;
+        we extract just enough to render a UI client-side. The original
+        message text is NOT included — clients already have it from their
+        own outbound send.
+        """
+        from nanobot.privacy.types import ConfirmationPrompt
+
+        if not isinstance(prompt, ConfirmationPrompt):
+            self.logger.warning("rejected non-ConfirmationPrompt payload")
+            return
+
+        # Register a Future BEFORE sending, so an instant reply still resolves.
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+        self._pending_confirmations[prompt.confirmation_id] = future
+
+        rec = prompt.recommendation
+        payload = {
+            "event": "privacy_confirmation",
+            "chat_id": chat_id,
+            "confirmation_id": prompt.confirmation_id,
+            "path": rec.path.value,
+            "reason": rec.reason,
+            "allowed": sorted(p.value for p in rec.allowed),
+            "entities": [
+                {
+                    "type": e.type.value,
+                    "risk_class": e.risk_class.value,
+                    "linkability": e.linkability.value,
+                    "value": e.value,
+                    "span": list(e.span),
+                    "confidence": e.confidence,
+                    "detector": e.detector,
+                }
+                for e in rec.entities
+            ],
+        }
+        raw = json.dumps(payload, ensure_ascii=False)
+        conns = list(self._subs.get(chat_id, ()))
+        if not conns:
+            self.logger.warning(
+                "no active subscribers for privacy confirmation chat_id={}", chat_id
+            )
+            # No client to reply — drop the Future so we don't leak it.
+            self._pending_confirmations.pop(prompt.confirmation_id, None)
+            future.cancel()
+            return
+        for connection in conns:
+            await self._safe_send_to(connection, raw, label=" privacy_confirmation ")
+
+    async def _await_privacy_confirmation_reply(
+        self, confirmation_id: str, timeout: float
+    ) -> Any:
+        """Block until the matching ``privacy_confirmation_reply`` arrives or
+        the timeout elapses. Returns a ConfirmationReply or None on timeout.
+        """
+        future = self._pending_confirmations.get(confirmation_id)
+        if future is None:
+            return None
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return None
+        finally:
+            self._pending_confirmations.pop(confirmation_id, None)
+
+    async def _handle_privacy_confirmation_reply(
+        self, connection: Any, envelope: dict[str, Any]
+    ) -> None:
+        from nanobot.privacy.types import ConfirmationReply, ExecutionPath
+
+        cid = envelope.get("confirmation_id")
+        if not isinstance(cid, str) or not cid:
+            await self._send_event(connection, "error", detail="invalid confirmation_id")
+            return
+        future = self._pending_confirmations.get(cid)
+        if future is None or future.done():
+            # Late or unknown reply — ignore silently rather than leaking
+            # whether a given confirmation_id existed.
+            return
+        chosen_raw = envelope.get("chosen_path")
+        chosen: ExecutionPath | None
+        if chosen_raw is None:
+            chosen = None  # cancel
+        else:
+            try:
+                chosen = ExecutionPath(str(chosen_raw).lower())
+            except ValueError:
+                await self._send_event(connection, "error", detail="invalid chosen_path")
+                return
+        future.set_result(ConfirmationReply(confirmation_id=cid, chosen_path=chosen))
 
     async def _safe_send_to(self, connection: Any, raw: str, *, label: str = "") -> None:
         """Send a raw frame to one connection, cleaning up on ConnectionClosed."""
