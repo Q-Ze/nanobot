@@ -188,6 +188,7 @@ class TurnState(Enum):
     RESTORE = auto()
     COMPACT = auto()
     COMMAND = auto()
+    GATE = auto()
     BUILD = auto()
     RUN = auto()
     SAVE = auto()
@@ -258,8 +259,10 @@ class AgentLoop:
     _TRANSITIONS: dict[tuple[TurnState, str], TurnState] = {
         (TurnState.RESTORE, "ok"): TurnState.COMPACT,
         (TurnState.COMPACT, "ok"): TurnState.COMMAND,
-        (TurnState.COMMAND, "dispatch"): TurnState.BUILD,
+        (TurnState.COMMAND, "dispatch"): TurnState.GATE,
         (TurnState.COMMAND, "shortcut"): TurnState.DONE,
+        (TurnState.GATE, "ok"): TurnState.BUILD,
+        (TurnState.GATE, "blocked"): TurnState.DONE,
         (TurnState.BUILD, "ok"): TurnState.RUN,
         (TurnState.RUN, "ok"): TurnState.SAVE,
         (TurnState.SAVE, "ok"): TurnState.RESPOND,
@@ -297,6 +300,7 @@ class AgentLoop:
         image_generation_provider_configs: dict[str, ProviderConfig] | None = None,
         provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
+        privacy_config: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -410,6 +414,15 @@ class AgentLoop:
         self.commands = CommandRouter()
         register_builtin_commands(self.commands)
 
+        # Privacy GateKeeper: instantiated only when enabled, otherwise the
+        # GATE state is a no-op pass-through (see _state_gate).
+        self._gatekeeper = None
+        self._channel_caps: dict[str, Any] = {}
+        if privacy_config is not None and getattr(privacy_config, "enabled", False):
+            from nanobot.privacy import GateKeeper
+
+            self._gatekeeper = GateKeeper.from_config(privacy_config)
+
     @classmethod
     def from_config(
         cls,
@@ -454,6 +467,7 @@ class AgentLoop:
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
             tools_config=config.tools,
+            privacy_config=getattr(config, "privacy", None),
             **extra,
         )
 
@@ -1412,6 +1426,109 @@ class AgentLoop:
             ctx.outbound = result
             return "shortcut"
         return "dispatch"
+
+    async def _state_gate(self, ctx: TurnContext) -> str:
+        """Privacy GateKeeper: detect, decide, confirm, transform.
+
+        Pass-through if disabled. Otherwise may block the message (sets
+        ctx.outbound to a refusal and returns "blocked"), rewrite content
+        (replace ctx.msg.content with sanitized text), or attach audit
+        metadata for downstream stages.
+        """
+        gate = getattr(self, "_gatekeeper", None)
+        if gate is None:
+            return "ok"
+        try:
+            recommendation = await gate.detect_and_recommend(ctx.msg.content)
+            user_pref = self._extract_user_path_preference(ctx.msg)
+            decision = await gate.confirm(
+                recommendation,
+                chat_id=ctx.msg.chat_id,
+                channel_name=ctx.msg.channel,
+                capabilities=self._channel_capabilities(ctx.msg.channel),
+                user_path_preference=user_pref,
+            )
+            outcome = gate.transform(decision, ctx.msg.content)
+            gate.record_audit(
+                session_key=ctx.session_key,
+                decision=decision,
+                view=outcome.audit_view,
+            )
+        except Exception:
+            logger.exception("Privacy GateKeeper failed; failing closed (blocking turn)")
+            ctx.outbound = OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content="Privacy GateKeeper error; message blocked (fail-closed).",
+                media=[],
+                metadata={"privacy_error": True},
+            )
+            return "blocked"
+
+        # Stash audit view so downstream stages (and tests) can inspect it.
+        meta = dict(ctx.msg.metadata or {})
+        if outcome.audit_view is not None:
+            meta["privacy"] = {
+                "path": outcome.audit_view.path.value,
+                "recommended_path": outcome.audit_view.recommended_path.value,
+                "source": outcome.audit_view.source.value,
+                "fidelity": outcome.audit_view.fidelity,
+            }
+        ctx.msg = dataclasses.replace(ctx.msg, metadata=meta)
+
+        from nanobot.privacy.types import ExecutionPath as _Path
+
+        if decision.path == _Path.BLOCKED:
+            refusal = outcome.privacy_message if isinstance(outcome.privacy_message, str) else (
+                outcome.privacy_message[0] if outcome.privacy_message else ""
+            )
+            ctx.outbound = OutboundMessage(
+                channel=ctx.msg.channel,
+                chat_id=ctx.msg.chat_id,
+                content=refusal or "Privacy GateKeeper blocked this message.",
+                media=[],
+                metadata=meta,
+            )
+            return "blocked"
+
+        # NORMAL / SIMPLE in M1: passthrough. If transform rewrote the content
+        # (future M2/M3), replace the inbound payload here.
+        if isinstance(outcome.privacy_message, str) and outcome.privacy_message != ctx.msg.content:
+            ctx.msg = dataclasses.replace(ctx.msg, content=outcome.privacy_message)
+        return "ok"
+
+    @staticmethod
+    def _extract_user_path_preference(msg: InboundMessage):
+        """Pull a user-supplied execution path from message metadata if present.
+
+        SDK callers set `metadata["privacy_path"]` to one of
+        {"normal","simple","k_decoy","metric_dp","blocked"}. Channels can
+        translate their own UX (slash commands, buttons) into the same key.
+        Unknown values are ignored.
+        """
+        from nanobot.privacy.types import ExecutionPath as _Path
+
+        raw = (msg.metadata or {}).get("privacy_path")
+        if not raw:
+            return None
+        try:
+            return _Path(str(raw).lower())
+        except ValueError:
+            return None
+
+    def _channel_capabilities(self, channel_name: str):
+        """Look up a channel's privacy capabilities, defaulting to non-interactive.
+
+        Channels register themselves into ``self._channel_caps`` (currently
+        unpopulated — M1 keeps everything non-interactive and relies on the
+        configured channel_fallback policy).
+        """
+        from nanobot.privacy.types import ChannelCapabilities
+
+        registry = getattr(self, "_channel_caps", None) or {}
+        if channel_name in registry:
+            return registry[channel_name]
+        return ChannelCapabilities()
 
     async def _state_build(self, ctx: TurnContext) -> str:
         await self.consolidator.maybe_consolidate_by_tokens(

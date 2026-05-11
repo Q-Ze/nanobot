@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+
+if TYPE_CHECKING:
+    from nanobot.privacy.types import ChannelCapabilities
 
 
 class BaseChannel(ABC):
@@ -28,6 +31,13 @@ class BaseChannel(ABC):
     transcription_language: str | None = None
     send_progress: bool = True
     send_tool_hints: bool = False
+
+    # Privacy GateKeeper capability flags. Channels that can interactively
+    # round-trip a confirmation prompt should override
+    # `privacy_capabilities()` to return supports_interactive_confirm=True
+    # and provide send/await callbacks.
+    privacy_supports_interactive_confirm: bool = False
+    privacy_confirmation_max_latency_seconds: int = 60
 
     def __init__(self, config: Any, bus: MessageBus):
         """
@@ -198,3 +208,20 @@ class BaseChannel(ABC):
     def is_running(self) -> bool:
         """Check if the channel is running."""
         return self._running
+
+    def privacy_capabilities(self) -> "ChannelCapabilities":
+        """Declare this channel's privacy-confirmation support.
+
+        Channels that can interactively confirm should override this to set
+        `supports_interactive_confirm=True` and provide non-None send/await
+        callbacks. The default returns a non-interactive capability — the
+        GateKeeper will then apply the configured channel fallback policy.
+        """
+        from nanobot.privacy.types import ChannelCapabilities
+
+        return ChannelCapabilities(
+            supports_interactive_confirm=self.privacy_supports_interactive_confirm,
+            confirmation_max_latency_seconds=self.privacy_confirmation_max_latency_seconds,
+            send_confirmation=None,
+            await_confirmation_reply=None,
+        )

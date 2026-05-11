@@ -280,6 +280,67 @@ class ToolsConfig(Base):
     ssrf_whitelist: list[str] = Field(default_factory=list)  # CIDR ranges to exempt from SSRF blocking (e.g. ["100.64.0.0/10"] for Tailscale)
 
 
+class PrivacyConfirmationConfig(Base):
+    """ConfirmationGate behaviour. See `.agent/privacy_gatekeeper.md` §3.7 / §5.2."""
+
+    mode: Literal["always", "risk_threshold", "never"] = "risk_threshold"
+    risk_threshold: Literal["low", "medium", "high", "catastrophic"] = "high"  # only when mode=risk_threshold
+    timeout_seconds: int = Field(default=60, ge=1, le=3600)
+    on_timeout: Literal["block", "recommended"] = "block"  # fail-closed default
+    channel_fallback_default: Literal["forced_conservative", "use_recommended", "reject"] = (
+        "forced_conservative"
+    )
+    channel_fallback_overrides: dict[str, Literal["forced_conservative", "use_recommended", "reject"]] = (
+        Field(default_factory=dict)
+    )
+
+
+class PrivacyAuditConfig(Base):
+    """Audit logger settings (M1: plaintext JSONL; envelope encryption arrives M4)."""
+
+    enabled: bool = True
+    log_dir: str = "~/.nanobot/privacy_audit"  # kept outside agent workspace per §3.6
+    kms_recipient: str | None = None  # reserved for M4 envelope encryption
+
+
+class PrivacyKDecoyConfig(Base):
+    """K-decoy parameters (placeholder schema for M2)."""
+
+    k_max: int = Field(default=3, ge=2, le=10)
+    allowed_risk: list[Literal["low", "medium"]] = Field(default_factory=lambda: ["low", "medium"])
+
+
+class PrivacyMetricDpConfig(Base):
+    """Metric-DP parameters (placeholder schema for M3)."""
+
+    eps_query: float = Field(default=8.0, gt=0)
+    eps_session_max: float = Field(default=32.0, gt=0)
+    eps_user_24h_max: float = Field(default=64.0, gt=0)
+
+
+class PrivacyConfig(Base):
+    """Privacy GateKeeper configuration. See `.agent/privacy_gatekeeper.md`.
+
+    M1 honours `enabled`, `confirmation`, `audit`, `regex_extensions`,
+    `risk_class_overrides`, `routing_mode`. The `k_decoy` / `metric_dp`
+    blocks accept config now so users don't need to migrate later, but
+    the runtime ignores them until M2/M3.
+    """
+
+    enabled: bool = False  # off by default; opt-in until detector recall is validated
+    local_model: str | None = None  # reserved for SIMPLE / METRIC_DP restorer (M3)
+    risk_class_overrides: dict[str, Literal["low", "medium", "high", "catastrophic"]] = (
+        Field(default_factory=dict)
+    )  # entity_type -> risk_class override
+    regex_extensions: list[str] = Field(default_factory=list)  # extra Python regex patterns to flag
+    routing_mode: Literal["conservative", "balanced", "honest"] = "conservative"
+    pseudonym_key_source: Literal["keyring", "env", "kms"] = "env"  # used M2+
+    confirmation: PrivacyConfirmationConfig = Field(default_factory=PrivacyConfirmationConfig)
+    audit: PrivacyAuditConfig = Field(default_factory=PrivacyAuditConfig)
+    k_decoy: PrivacyKDecoyConfig = Field(default_factory=PrivacyKDecoyConfig)
+    metric_dp: PrivacyMetricDpConfig = Field(default_factory=PrivacyMetricDpConfig)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -289,6 +350,7 @@ class Config(BaseSettings):
     api: ApiConfig = Field(default_factory=ApiConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
 
     @property
     def workspace_path(self) -> Path:
