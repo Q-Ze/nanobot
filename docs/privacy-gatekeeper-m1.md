@@ -65,7 +65,7 @@ That alone gives you:
 {
   "privacy": {
     "enabled": true,
-    "local_model": null,
+    "local_model": "ollama/qwen2.5:0.5b",
     "risk_class_overrides": {
       "email": "low",
       "ip": "medium"
@@ -95,11 +95,19 @@ That alone gives you:
 
 | Key | Meaning |
 |---|---|
+| `local_model` | A model identifier in the same shape as `agents.defaults.model` (e.g. `"ollama/qwen2.5:0.5b"`, `"lm_studio/Qwen2.5-1.5B"`, `"anthropic/claude-haiku-4-5"`). The provider is resolved through the existing `providers.*` config blocks — no separate endpoint/auth needs to be configured here. M1.5 instantiates the backend but doesn't yet use it (SemanticDetector / K-decoy / Metric-DP arrive in M2/M3). |
 | `risk_class_overrides` | Demote/promote a specific entity type's risk class. Use this to fix systematic false positives instead of per-message overrides. |
 | `regex_extensions` | Extra Python regex patterns that flag user-defined sensitive strings (mapped to `EntityType.OTHER`, risk class `LOW`). |
 | `confirmation.mode` | `always` = ask every relevant turn; `risk_threshold` (default) = only when risk ≥ threshold or path is non-trivial; `never` = silent automated decisions. |
 | `confirmation.on_timeout` | `block` (default, fail-closed) or `recommended` (use system suggestion when user is slow). |
 | `channel_fallback_*` | What to do on channels that can't ask interactively. `forced_conservative` = pick the strictest path in the allowed set; `use_recommended` = trust the system suggestion; `reject` = bounce the message. |
+
+**Local model selection.** If `local_model` is set, the GateKeeper builds
+an `LLMProviderBackend` using the same `make_provider` machinery that
+constructs the main agent provider. You configure auth/endpoint exactly
+where you already do — e.g. `providers.ollama.api_base` for an Ollama
+endpoint. Pointing `local_model` at a cloud model (Anthropic, OpenAI…)
+is supported too; "local" here is a role, not a hard locality requirement.
 
 ### 2.3 User-supplied path preference (SDK / power users)
 

@@ -18,9 +18,19 @@ class ProviderSnapshot:
     signature: tuple[object, ...]
 
 
-def make_provider(config: Config) -> LLMProvider:
-    """Create the LLM provider implied by config."""
-    model = config.agents.defaults.model
+def make_provider(config: Config, *, model_override: str | None = None) -> LLMProvider:
+    """Create the LLM provider implied by config.
+
+    Args:
+        config: Root nanobot Config instance.
+        model_override: Build a provider for *this* model instead of the
+            ``agents.defaults.model``. Used by the Privacy GateKeeper to
+            instantiate a local-model backend (``privacy.local_model``)
+            without disturbing the main agent provider. The model string is
+            resolved through the same ``providers.*`` registry as the
+            default model.
+    """
+    model = model_override or config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
     spec = find_by_name(provider_name) if provider_name else None

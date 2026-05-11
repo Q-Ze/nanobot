@@ -318,34 +318,23 @@ class PrivacyMetricDpConfig(Base):
     eps_user_24h_max: float = Field(default=64.0, gt=0)
 
 
-class PrivacyLocalModelConfig(Base):
-    """Local-model backend used by SemanticDetector / K-decoy / Metric-DP restorer.
-
-    M1.5 only defines the shape; no backend is wired yet. Users who want to
-    plug in a real backend (Ollama, LM Studio, llama.cpp) before the packaged
-    integration ships can use ``nanobot.privacy.local_model.set_default`` from
-    code — config fields here exist so a later release can drive selection
-    declaratively.
-    """
-
-    provider: Literal["null", "ollama", "lm_studio", "openai_compatible"] = "null"
-    endpoint: str | None = None              # e.g. "http://localhost:11434"
-    model: str | None = None                 # e.g. "qwen2.5:0.5b"
-    api_key: str | None = None
-    timeout_seconds: int = Field(default=10, ge=1, le=120)
-
-
 class PrivacyConfig(Base):
     """Privacy GateKeeper configuration. See `.agent/privacy_gatekeeper.md`.
 
-    M1 honours `enabled`, `confirmation`, `audit`, `regex_extensions`,
-    `risk_class_overrides`, `routing_mode`. The `k_decoy` / `metric_dp`
-    blocks accept config now so users don't need to migrate later, but
-    the runtime ignores them until M2/M3.
+    M1.5 honours `enabled`, `local_model`, `confirmation`, `audit`,
+    `regex_extensions`, `risk_class_overrides`, `routing_mode`. The
+    `k_decoy` / `metric_dp` blocks accept config now so users don't need
+    to migrate later, but the runtime ignores them until M2/M3.
+
+    `local_model` is a model identifier in the same shape as
+    `agents.defaults.model` — e.g. ``"ollama/qwen2.5:0.5b"`` or
+    ``"lm_studio/Qwen2.5-1.5B"``. It reuses the existing `providers.*`
+    config blocks (api_key / api_base / extra_headers / extra_body); no
+    separate endpoint/auth needs to be configured here.
     """
 
     enabled: bool = False  # off by default; opt-in until detector recall is validated
-    local_model: PrivacyLocalModelConfig = Field(default_factory=PrivacyLocalModelConfig)
+    local_model: str | None = None  # e.g. "ollama/qwen2.5:0.5b"; resolves via providers.*
     risk_class_overrides: dict[str, Literal["low", "medium", "high", "catastrophic"]] = (
         Field(default_factory=dict)
     )  # entity_type -> risk_class override

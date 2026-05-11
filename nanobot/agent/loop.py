@@ -301,6 +301,7 @@ class AgentLoop:
         provider_snapshot_loader: Callable[[], ProviderSnapshot] | None = None,
         provider_signature: tuple[object, ...] | None = None,
         privacy_config: Any | None = None,
+        gatekeeper: Any | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, ToolsConfig, WebToolsConfig
 
@@ -415,13 +416,20 @@ class AgentLoop:
         register_builtin_commands(self.commands)
 
         # Privacy GateKeeper: instantiated only when enabled, otherwise the
-        # GATE state is a no-op pass-through (see _state_gate).
-        self._gatekeeper = None
+        # GATE state is a no-op pass-through (see _state_gate). A fully-built
+        # gatekeeper may be injected (typical path: AgentLoop.from_config
+        # resolves the local-model backend via providers.* and constructs it
+        # there); otherwise we build a vanilla one from privacy_config alone
+        # (no local-model backend) when enabled.
         self._channel_caps: dict[str, Any] = {}
-        if privacy_config is not None and getattr(privacy_config, "enabled", False):
+        if gatekeeper is not None:
+            self._gatekeeper = gatekeeper
+        elif privacy_config is not None and getattr(privacy_config, "enabled", False):
             from nanobot.privacy import GateKeeper
 
             self._gatekeeper = GateKeeper.from_config(privacy_config)
+        else:
+            self._gatekeeper = None
 
     @classmethod
     def from_config(
@@ -444,6 +452,20 @@ class AgentLoop:
         provider = extra.pop("provider", None) or make_provider(config)
         model = extra.pop("model", None) or defaults.model
         context_window_tokens = extra.pop("context_window_tokens", None) or defaults.context_window_tokens
+
+        # Build the privacy GateKeeper here (rather than inside __init__) so we
+        # can resolve `privacy.local_model` against the full providers.* config.
+        gatekeeper = extra.pop("gatekeeper", None)
+        privacy_cfg = getattr(config, "privacy", None)
+        if gatekeeper is None and privacy_cfg is not None and getattr(privacy_cfg, "enabled", False):
+            from nanobot.privacy import GateKeeper
+            from nanobot.privacy.local_model import build_from_root_config
+
+            gatekeeper = GateKeeper.from_config(
+                privacy_cfg,
+                local_model=build_from_root_config(config),
+            )
+
         return cls(
             bus=bus,
             provider=provider,
@@ -467,7 +489,8 @@ class AgentLoop:
             consolidation_ratio=defaults.consolidation_ratio,
             max_messages=defaults.max_messages,
             tools_config=config.tools,
-            privacy_config=getattr(config, "privacy", None),
+            privacy_config=privacy_cfg,
+            gatekeeper=gatekeeper,
             **extra,
         )
 
