@@ -1478,7 +1478,11 @@ class AgentLoop:
 
         from nanobot.privacy.types import ExecutionPath as _Path
 
-        if decision.path == _Path.BLOCKED:
+        # Only NORMAL is allowed to reach the cloud LLM in M1.5. BLOCKED short-circuits
+        # to DONE; SIMPLE / K_DECOY / METRIC_DP are accepted by the type system but the
+        # transformers are not implemented yet — they must NOT silently leak plaintext
+        # to the cloud, so we treat them as blocked at the integration layer too.
+        if decision.path == _Path.BLOCKED or decision.path != _Path.NORMAL:
             refusal = outcome.privacy_message if isinstance(outcome.privacy_message, str) else (
                 outcome.privacy_message[0] if outcome.privacy_message else ""
             )
@@ -1491,8 +1495,8 @@ class AgentLoop:
             )
             return "blocked"
 
-        # NORMAL / SIMPLE in M1: passthrough. If transform rewrote the content
-        # (future M2/M3), replace the inbound payload here.
+        # NORMAL: forward to the cloud as-is. M2/M3 transformers may rewrite the
+        # content (e.g. pseudonym substitution); honour any rewrite here.
         if isinstance(outcome.privacy_message, str) and outcome.privacy_message != ctx.msg.content:
             ctx.msg = dataclasses.replace(ctx.msg, content=outcome.privacy_message)
         return "ok"

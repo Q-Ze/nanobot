@@ -118,3 +118,30 @@ async def test_restore_is_identity_for_m1_paths(tmp_path: Path):
     outcome = gate.transform(decision, "Hello world")
     restored = await gate.restore("LLM reply", outcome)
     assert restored == "LLM reply"
+
+
+async def test_simple_path_is_not_exposed_in_m1_5(tmp_path: Path):
+    """M1.5 hard-disables SIMPLE in the allowed set even if a backend is wired."""
+    cfg = PrivacyConfig(enabled=True)
+    cfg.audit.log_dir = str(tmp_path)
+    # local_model defaults to PrivacyLocalModelConfig(provider="null") — already
+    # unavailable. SIMPLE must still be absent from the allowed set.
+    gate = GateKeeper.from_config(cfg)
+    rec = await gate.detect_and_recommend("Hello, my name is Alice.")
+    assert ExecutionPath.SIMPLE not in rec.allowed
+
+
+def test_transform_refuses_unimplemented_paths(tmp_path: Path):
+    """Defensive: if a non-NORMAL/BLOCKED path somehow reaches transform, refuse."""
+    cfg = PrivacyConfig(enabled=True)
+    cfg.audit.log_dir = str(tmp_path)
+    gate = GateKeeper.from_config(cfg)
+    rec = Recommendation(
+        path=ExecutionPath.K_DECOY,
+        allowed=frozenset({ExecutionPath.K_DECOY, ExecutionPath.BLOCKED}),
+        reason="t",
+        entities=(_entity(),),
+    )
+    decision = Decision(path=ExecutionPath.K_DECOY, source=PathSource.SYSTEM_AUTO, recommendation=rec)
+    outcome = gate.transform(decision, "raw text")
+    assert "not implemented" in outcome.privacy_message.lower()

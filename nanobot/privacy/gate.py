@@ -15,6 +15,8 @@ from nanobot.privacy.audit import AuditLogger
 from nanobot.privacy.confirmation import ConfirmationGate
 from nanobot.privacy.decider import DeciderInputs, ExecutionDecider
 from nanobot.privacy.detector import PrivacyEntityDetector
+from nanobot.privacy.local_model import LocalModelBackend
+from nanobot.privacy.local_model import get_default as get_default_backend
 from nanobot.privacy.types import (
     AuditView,
     ChannelCapabilities,
@@ -38,6 +40,7 @@ class GateKeeper:
         decider: ExecutionDecider,
         confirmation: ConfirmationGate,
         audit: AuditLogger,
+        local_model: LocalModelBackend | None = None,
         local_model_available: bool = False,
         k_decoy_supported: bool = False,
         metric_dp_supported: bool = False,
@@ -46,9 +49,10 @@ class GateKeeper:
         self._decider = decider
         self._confirmation = confirmation
         self._audit = audit
+        self._local_model: LocalModelBackend = local_model or get_default_backend()
         self._caps = DeciderInputs(
             entities=(),
-            local_model_available=local_model_available,
+            local_model_available=local_model_available and self._local_model.is_available(),
             k_decoy_supported=k_decoy_supported,
             metric_dp_supported=metric_dp_supported,
         )
@@ -59,12 +63,17 @@ class GateKeeper:
         config: PrivacyConfig,
         *,
         semantic_detector: "object | None" = None,
+        local_model: LocalModelBackend | None = None,
     ) -> "GateKeeper":
         """Build a GateKeeper from PrivacyConfig.
 
         Pass ``semantic_detector`` to plug in a local-LM-backed second pass
         (must implement :class:`nanobot.privacy.detector.SemanticDetector`).
-        M1 defaults to a no-op semantic layer.
+        Pass ``local_model`` to override the process-default
+        :class:`LocalModelBackend` for this gate.
+
+        M1.5 defaults to NoopSemanticDetector + NullLocalModel — both are
+        no-ops, so K_DECOY / METRIC_DP / SIMPLE remain unavailable.
         """
         detector = PrivacyEntityDetector(
             risk_class_overrides=config.risk_class_overrides,
@@ -89,7 +98,8 @@ class GateKeeper:
             decider=decider,
             confirmation=confirmation,
             audit=audit,
-            local_model_available=bool(config.local_model),
+            local_model=local_model,
+            local_model_available=False,  # M1.5: SIMPLE/local-only execution not yet wired
             k_decoy_supported=False,   # M2
             metric_dp_supported=False, # M3
         )
@@ -119,8 +129,13 @@ class GateKeeper:
         )
 
     def transform(self, decision: Decision, raw_message: str) -> TransformOutcome:
-        """M1 passthrough: NORMAL keeps message; BLOCKED replaces with refusal; SIMPLE
-        is currently treated like NORMAL (until a local model handler is wired in M3).
+        """M1.5 paths: NORMAL forwards as-is, BLOCKED replaces with a refusal.
+
+        SIMPLE / K_DECOY / METRIC_DP are accepted by the type system but not
+        yet implemented. Hitting them at runtime indicates a config or
+        decider bug — we defensively return a refusal rather than silently
+        forwarding plaintext to the cloud (which would defeat the gate's
+        purpose).
         """
         view = self._audit.build_view(decision, decision.recommendation.entities)
         if decision.path == ExecutionPath.BLOCKED:
@@ -129,8 +144,17 @@ class GateKeeper:
                 privacy_message=decision.refusal_message or _default_refusal(decision),
                 audit_view=view,
             )
-        # NORMAL / SIMPLE: send original message; restoration is a no-op.
-        return TransformOutcome(decision=decision, privacy_message=raw_message, audit_view=view)
+        if decision.path == ExecutionPath.NORMAL:
+            return TransformOutcome(decision=decision, privacy_message=raw_message, audit_view=view)
+        # SIMPLE / K_DECOY / METRIC_DP — not yet implemented in M1.5.
+        return TransformOutcome(
+            decision=decision,
+            privacy_message=(
+                f"Privacy GateKeeper: path '{decision.path.value}' is not implemented yet "
+                "(see docs/privacy-gatekeeper-m1.md §5). Message blocked."
+            ),
+            audit_view=view,
+        )
 
     async def restore(self, response: str, outcome: TransformOutcome) -> str:
         """No-op for M1 paths."""

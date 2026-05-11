@@ -318,6 +318,23 @@ class PrivacyMetricDpConfig(Base):
     eps_user_24h_max: float = Field(default=64.0, gt=0)
 
 
+class PrivacyLocalModelConfig(Base):
+    """Local-model backend used by SemanticDetector / K-decoy / Metric-DP restorer.
+
+    M1.5 only defines the shape; no backend is wired yet. Users who want to
+    plug in a real backend (Ollama, LM Studio, llama.cpp) before the packaged
+    integration ships can use ``nanobot.privacy.local_model.set_default`` from
+    code — config fields here exist so a later release can drive selection
+    declaratively.
+    """
+
+    provider: Literal["null", "ollama", "lm_studio", "openai_compatible"] = "null"
+    endpoint: str | None = None              # e.g. "http://localhost:11434"
+    model: str | None = None                 # e.g. "qwen2.5:0.5b"
+    api_key: str | None = None
+    timeout_seconds: int = Field(default=10, ge=1, le=120)
+
+
 class PrivacyConfig(Base):
     """Privacy GateKeeper configuration. See `.agent/privacy_gatekeeper.md`.
 
@@ -328,7 +345,7 @@ class PrivacyConfig(Base):
     """
 
     enabled: bool = False  # off by default; opt-in until detector recall is validated
-    local_model: str | None = None  # reserved for SIMPLE / METRIC_DP restorer (M3)
+    local_model: PrivacyLocalModelConfig = Field(default_factory=PrivacyLocalModelConfig)
     risk_class_overrides: dict[str, Literal["low", "medium", "high", "catastrophic"]] = (
         Field(default_factory=dict)
     )  # entity_type -> risk_class override
