@@ -36,6 +36,8 @@ import json
 import re
 from dataclasses import dataclass
 
+from loguru import logger
+
 from nanobot.privacy.detector import _resolve_risk
 from nanobot.privacy.local_model import LocalModelBackend, NullLocalModel
 from nanobot.privacy.types import DetectedEntity, EntityType, Linkability
@@ -72,9 +74,10 @@ _TEMPERATURE = 0.0
 # Don't bother calling the LM on tiny inputs (also avoids prompt-cost noise).
 _MIN_TEXT_LEN = 4
 
-# Per-call timeout. Local models on CPU sometimes stall; we don't want the
-# whole agent turn to hang waiting on the privacy gate.
-_DEFAULT_TIMEOUT_SECONDS = 5.0
+# Per-call timeout. Local fast models on a workstation are typically <2 s; the
+# default budget is sized for slower / cloud-backed local roles. Overridable
+# via PrivacyConfig.semantic_timeout_seconds (see schema.py).
+_DEFAULT_TIMEOUT_SECONDS = 15.0
 
 
 @dataclass
@@ -93,7 +96,8 @@ class LLMSemanticDetector:
     confidence:
         Score attached to every LM-derived entity. Default 0.7.
     timeout_seconds:
-        Per-detect-call wall clock cap. Hitting the timeout returns ``[]``.
+        Per-detect-call wall clock cap. Hitting the timeout returns ``[]``
+        and emits a warning log so users can spot the misconfiguration.
     """
 
     backend: LocalModelBackend
@@ -121,15 +125,31 @@ class LLMSemanticDetector:
                 ),
                 timeout=self.timeout_seconds,
             )
-        except (asyncio.TimeoutError, Exception):
+        except asyncio.TimeoutError:
+            logger.warning(
+                "privacy.semantic: LM call exceeded timeout={}s — returning no entities. "
+                "Increase privacy.semantic_timeout_seconds in config if your backend is slow.",
+                self.timeout_seconds,
+            )
+            return []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "privacy.semantic: backend.generate raised {!r} — returning no entities.",
+                exc,
+            )
             return []
 
         parsed = _parse_json_array(response)
         if not parsed:
+            if response:
+                logger.debug(
+                    "privacy.semantic: LM returned non-JSON {!r:.120} — no entities.", response
+                )
             return []
 
         overrides = self.risk_class_overrides or {}
         entities: list[DetectedEntity] = []
+        dropped_hallucinations = 0
         for item in parsed:
             if not isinstance(item, dict):
                 continue
@@ -140,7 +160,8 @@ class LLMSemanticDetector:
             entity_type = _KNOWN_TYPES.get(type_raw.strip().lower(), EntityType.OTHER)
             span = _find_span(raw_message, value)
             if span is None:
-                continue  # hallucination — value not in raw text
+                dropped_hallucinations += 1
+                continue
             entities.append(
                 DetectedEntity(
                     type=entity_type,
@@ -151,6 +172,12 @@ class LLMSemanticDetector:
                     confidence=self.confidence,
                     detector="semantic:llm",
                 )
+            )
+        if dropped_hallucinations:
+            logger.debug(
+                "privacy.semantic: dropped {} hallucinated entit{} (value not found in source)",
+                dropped_hallucinations,
+                "y" if dropped_hallucinations == 1 else "ies",
             )
         return entities
 

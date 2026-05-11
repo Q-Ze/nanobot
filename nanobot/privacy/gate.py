@@ -86,6 +86,7 @@ class GateKeeper:
             semantic_detector = LLMSemanticDetector(
                 backend=local_model,
                 risk_class_overrides=config.risk_class_overrides,
+                timeout_seconds=config.semantic_timeout_seconds,
             )
         detector = PrivacyEntityDetector(
             risk_class_overrides=config.risk_class_overrides,

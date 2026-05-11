@@ -66,6 +66,7 @@ That alone gives you:
   "privacy": {
     "enabled": true,
     "local_model": "ollama/qwen2.5:0.5b",
+    "semantic_timeout_seconds": 15,
     "risk_class_overrides": {
       "email": "low",
       "ip": "medium"
@@ -96,6 +97,7 @@ That alone gives you:
 | Key | Meaning |
 |---|---|
 | `local_model` | A model identifier in the same shape as `agents.defaults.model` (e.g. `"ollama/qwen2.5:0.5b"`, `"lm_studio/Qwen2.5-1.5B"`, `"anthropic/claude-haiku-4-5"`). The provider is resolved through the existing `providers.*` config blocks — no separate endpoint/auth needs to be configured here. M1.5 instantiates the backend but doesn't yet use it (SemanticDetector / K-decoy / Metric-DP arrive in M2/M3). |
+| `semantic_timeout_seconds` | Per-call wall-clock cap for the LLM-backed `SemanticDetector`. Default 15 s — fits a fast local model on a workstation. Bump to 30–60 s if you point `local_model` at a slow / cloud / free-tier endpoint, otherwise the LM call silently times out and the gate falls back to regex-only detection (audible in the logs as `privacy.semantic: LM call exceeded timeout`). |
 | `risk_class_overrides` | Demote/promote a specific entity type's risk class. Use this to fix systematic false positives instead of per-message overrides. |
 | `regex_extensions` | Extra Python regex patterns that flag user-defined sensitive strings (mapped to `EntityType.OTHER`, risk class `LOW`). |
 | `confirmation.mode` | `always` = ask every relevant turn; `risk_threshold` (default) = only when risk ≥ threshold or path is non-trivial; `never` = silent automated decisions. |
@@ -168,7 +170,35 @@ Note: **`value` of the credential is NOT in the log line.** Only counts and type
 
 ## 4. How to test
 
-### 4.0 Try it from the CLI in one minute
+### 4.0 Quick triage when "it's not triggering"
+
+If you opt the gate in and your test message doesn't trigger anything,
+run the diagnostic script — it walks the pipeline layer by layer and
+prints what each one returned (config → backend → smoke test → detector
+→ semantic-LM raw call → decider → confirmation → transformer):
+
+```bash
+python scripts/debug_privacy.py \
+  --config /root/.nanobot/config.json \
+  -m "Hello, my api key is sk-xsadsafsgdrghr"
+```
+
+Common findings and fixes:
+
+| What the script shows | Likely cause | Fix |
+|---|---|---|
+| `privacy.enabled = False` at step 1 | Config not opted in | Set `privacy.enabled = true` in `config.json` |
+| step 2 prints `✗ build_from_root_config returned None` with `local_model` set | Provider auth/api_base missing for that model | Configure the matching `providers.<name>` block (see §2.2) |
+| step 2 smoke test returns `''` | Backend reachable but model not pulled / wrong name | Pull the model (e.g. `ollama pull qwen2.5:0.5b`) or fix the model id |
+| step 3 finds no entities, step 3b raw response shows valid JSON, but it dropped to "hallucination" | The LM rephrased the value (common with very small Chinese-name detectors) | Try a stronger model or relax via custom `SemanticDetector` |
+| step 3b shows `Error: ... 429 ... rate-limited` | Free-tier upstream throttling | Add your own provider key or switch model |
+| step 3 finds nothing AND step 3b shows empty response | LM call timed out silently | Increase `privacy.semantic_timeout_seconds` in config (default 15 s) |
+
+Same script also doubles as a feature smoke test: run with a known
+trigger like `sk-xsadsafsgdrghr` and confirm the path walks all the way
+to `blocked` at step 5.
+
+### 4.1 Try it from the CLI in one minute
 
 Enable GateKeeper in your config (or use `NANOBOT_PRIVACY__ENABLED=true`):
 

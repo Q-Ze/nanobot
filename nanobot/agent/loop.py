@@ -424,10 +424,19 @@ class AgentLoop:
         self._channel_caps: dict[str, Any] = {}
         if gatekeeper is not None:
             self._gatekeeper = gatekeeper
+            backend_name = getattr(getattr(gatekeeper, "_local_model", None), "name", "null")
+            logger.info(
+                "Privacy GateKeeper enabled (backend={}, semantic={})",
+                backend_name,
+                "auto-wired" if backend_name != "null" else "regex-only",
+            )
         elif privacy_config is not None and getattr(privacy_config, "enabled", False):
             from nanobot.privacy import GateKeeper
 
             self._gatekeeper = GateKeeper.from_config(privacy_config)
+            logger.info(
+                "Privacy GateKeeper enabled (regex-only; no local_model backend wired)"
+            )
         else:
             self._gatekeeper = None
 
