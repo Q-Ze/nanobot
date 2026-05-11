@@ -1040,6 +1040,15 @@ def agent(
     except ValueError as exc:
         console.print(f"[red]Error: {exc}[/red]")
         raise typer.Exit(1) from exc
+
+    # Register CLI capabilities for privacy GateKeeper interactive confirmation.
+    # No-op when privacy is disabled (gatekeeper is None).
+    if getattr(agent_loop, "_gatekeeper", None) is not None:
+        from nanobot.privacy.cli_channel_caps import make_cli_channel_caps
+
+        cli_caps = make_cli_channel_caps(console)
+        # Cover both the single-shot ("cli") and interactive ("cli:<id>" or custom) channels.
+        agent_loop._channel_caps["cli"] = cli_caps
     restart_notice = consume_restart_notice_from_env()
     if restart_notice and should_show_cli_restart_notice(restart_notice, session_id):
         _print_agent_response(

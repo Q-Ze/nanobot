@@ -54,11 +54,22 @@ class GateKeeper:
         )
 
     @classmethod
-    def from_config(cls, config: PrivacyConfig) -> "GateKeeper":
+    def from_config(
+        cls,
+        config: PrivacyConfig,
+        *,
+        semantic_detector: "object | None" = None,
+    ) -> "GateKeeper":
+        """Build a GateKeeper from PrivacyConfig.
+
+        Pass ``semantic_detector`` to plug in a local-LM-backed second pass
+        (must implement :class:`nanobot.privacy.detector.SemanticDetector`).
+        M1 defaults to a no-op semantic layer.
+        """
         detector = PrivacyEntityDetector(
             risk_class_overrides=config.risk_class_overrides,
             regex_extensions=config.regex_extensions,
-            semantic=None,  # M1: noop; later wire SmallLM-based semantic detector
+            semantic=semantic_detector,  # None falls back to NoopSemanticDetector inside the class
         )
         decider = ExecutionDecider()
         confirm_cfg = config.confirmation

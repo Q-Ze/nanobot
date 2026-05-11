@@ -42,6 +42,27 @@ async def test_detects_openai_key(detector):
     assert any(e.type == EntityType.CREDENTIAL for e in ents)
 
 
+async def test_detects_short_fake_sk_key(detector):
+    # Real OpenAI keys are very long, but users testing the feature often paste
+    # short fakes like "sk-xsadsafsgdrghr" — we still want to flag those.
+    ents = await detector.detect("Hello, my api key is sk-xsadsafsgdrghr")
+    assert any(
+        e.type == EntityType.CREDENTIAL and e.risk_class == RiskClass.CATASTROPHIC
+        for e in ents
+    )
+
+
+async def test_detects_github_token_variants(detector):
+    for tok in ["ghp_xxxxxxxxxxxxxxxxxxxx", "gho_aaaaaaaaaaaaaaaaaaaa", "ghs_bbbbbbbbbbbbbbbbbbbb"]:
+        ents = await detector.detect(f"token: {tok}")
+        assert any(e.type == EntityType.CREDENTIAL for e in ents), f"missed {tok}"
+
+
+async def test_detects_huggingface_token(detector):
+    ents = await detector.detect("HF_TOKEN=hf_AbCdEf0123456789AbCdEf01")
+    assert any(e.type == EntityType.CREDENTIAL for e in ents)
+
+
 async def test_detects_jwt(detector):
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.SflKxwRJSMeKKF0_signature"
     ents = await detector.detect(f"token={jwt}")

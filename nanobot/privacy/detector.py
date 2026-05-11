@@ -69,16 +69,23 @@ _RE_IPV4 = re.compile(
 _RE_IPV6 = re.compile(r"\b(?:[A-Fa-f0-9]{1,4}:){2,7}[A-Fa-f0-9]{1,4}\b")
 
 # Cloud / SaaS credential prefixes — high precision, chosen to avoid catching prose.
+# The `sk-` family (OpenAI, DeepSeek, Moonshot, …) accepts ≥8 chars after the prefix
+# so test/fake keys also trigger; real keys are far longer.
 _CRED_PREFIXES = [
     ("aws_access_key_id", r"\bAKIA[0-9A-Z]{16}\b"),
     ("aws_secret", r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"),  # context-checked below
     ("google_api", r"\bAIza[0-9A-Za-z\-_]{35}\b"),
-    ("openai", r"\bsk-[A-Za-z0-9]{20,}\b"),
-    ("anthropic", r"\bsk-ant-[A-Za-z0-9\-_]{20,}\b"),
-    ("github_pat", r"\bghp_[A-Za-z0-9]{36}\b"),
-    ("github_app", r"\bghs_[A-Za-z0-9]{36}\b"),
+    ("anthropic", r"\bsk-ant-[A-Za-z0-9\-_]{8,}\b"),
+    ("sk_prefixed", r"\bsk-(?!ant-)[A-Za-z0-9_\-]{8,}\b"),  # OpenAI/DeepSeek/Moonshot etc.
+    ("github_pat", r"\bghp_[A-Za-z0-9]{20,}\b"),
+    ("github_oauth", r"\bgho_[A-Za-z0-9]{20,}\b"),
+    ("github_user", r"\bghu_[A-Za-z0-9]{20,}\b"),
+    ("github_server", r"\bghs_[A-Za-z0-9]{20,}\b"),
+    ("github_refresh", r"\bghr_[A-Za-z0-9]{20,}\b"),
     ("slack_bot", r"\bxox[abp]-[A-Za-z0-9\-]{10,}\b"),
     ("stripe_live", r"\bsk_live_[A-Za-z0-9]{16,}\b"),
+    ("stripe_test", r"\bsk_test_[A-Za-z0-9]{16,}\b"),
+    ("hf_token", r"\bhf_[A-Za-z0-9]{20,}\b"),
 ]
 _RE_CREDENTIALS = [(name, re.compile(p)) for name, p in _CRED_PREFIXES]
 

@@ -160,6 +160,37 @@ Note: **`value` of the credential is NOT in the log line.** Only counts and type
 
 ## 4. How to test
 
+### 4.0 Try it from the CLI in one minute
+
+Enable GateKeeper in your config (or use `NANOBOT_PRIVACY__ENABLED=true`):
+
+```json
+{ "privacy": { "enabled": true } }
+```
+
+Then send a message that contains an obvious credential:
+
+```bash
+nanobot agent -m "Hello, my api key is sk-xsadsafsgdrghr" \
+              --config ~/.nanobot/config.json
+```
+
+What you should see:
+
+1. The CLI prints a **🛡 Privacy GateKeeper** banner listing the detected
+   entity (`credential / catastrophic`), the recommended path (`blocked`),
+   and your options.
+2. The default mode is `risk_threshold` — because the entity is
+   `catastrophic`, the gate asks you to confirm. Press Enter to accept the
+   recommendation (block), or `[c]` to cancel.
+3. The cloud LLM is **never called** when the path is `blocked`. You get a
+   refusal message instead.
+4. An entry appears in `~/.nanobot/privacy_audit/audit-YYYYMMDD.jsonl`.
+
+If you want fully automated runs without interactive prompts, set
+`privacy.confirmation.mode = "never"` — the gate then applies its
+recommendation silently.
+
 ### 4.1 Run the privacy unit tests
 
 ```bash
@@ -251,10 +282,30 @@ tail -1 ~/.nanobot/privacy_audit/audit-*.jsonl | python -m json.tool
 - **Anonymize and forward.** Any MEDIUM/HIGH entity blocks the message in M1.
   This is intentional fail-closed behavior pending the K-decoy (M2) and
   Metric-DP (M3) transformers.
-- **Interactive confirmation in chat channels.** The flow is wired and tested,
-  but no channel currently implements `send_confirmation` / `await_confirmation_reply`.
-  All channels fall back to `forced_conservative` for now. M2 adds at least
-  the WebSocket/WebUI implementation.
+- **Built-in semantic (small-model) detection.** M1 ships a regex layer
+  only; the `SemanticDetector` slot is a no-op. Two ways to fill it:
+  - **Wait for M2/M3** — a packaged local-LM-based detector is on the
+    roadmap. The `privacy.local_model` config field is reserved for it.
+  - **Plug your own now**: implement the protocol and inject it:
+
+    ```python
+    from nanobot.privacy import GateKeeper
+    from nanobot.privacy.detector import SemanticDetector
+
+    class MySmallLM:
+        async def detect(self, raw_message, regex_hits):
+            # call your local model here (Ollama, LM Studio, llama.cpp, …)
+            # return a list of nanobot.privacy.types.DetectedEntity
+            return []
+
+    gate = GateKeeper.from_config(config.privacy, semantic_detector=MySmallLM())
+    ```
+- **Interactive confirmation in non-CLI channels.** CLI is wired (see §4.0).
+  Telegram, Discord, Slack, WebSocket, WebUI all fall back to
+  `forced_conservative` until each implements
+  `BaseChannel.privacy_capabilities()` with real `send_confirmation` /
+  `await_confirmation_reply` callbacks. M2 will ship the WebSocket/WebUI
+  implementation.
 - **Tool-output filtering.** GateKeeper only inspects the user's inbound
   message. Filesystem reads, MCP tool outputs, etc. are not scanned. M4 adds
   catastrophic-entity scanning on outbound tool results.
