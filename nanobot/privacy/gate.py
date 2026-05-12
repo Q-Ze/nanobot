@@ -182,7 +182,21 @@ class GateKeeper:
             entities=tuple(entities),
             metric_dp_supported=metric_dp_supported,
         )
-        return self._decider.decide(inputs)
+        recommendation = self._decider.decide(inputs)
+        # Visible breadcrumb showing detector + decider outcome.
+        # We log counts and types but never raw entity values.
+        type_counts: dict[str, int] = {}
+        for e in entities:
+            type_counts[e.type.value] = type_counts.get(e.type.value, 0) + 1
+        logger.info(
+            "privacy.detect: {} entit{} {}; decider → {} (reason: {})",
+            len(entities),
+            "y" if len(entities) == 1 else "ies",
+            dict(type_counts) if type_counts else "{}",
+            recommendation.path.value,
+            recommendation.reason,
+        )
+        return recommendation
 
     async def confirm(
         self,
@@ -256,6 +270,15 @@ class GateKeeper:
                 "mapping": dict(mdp.mapping),
                 "failed_entity_types": [e.type.value for e in mdp.failures],
             }
+            # Visible breadcrumb (no raw values; only counts + ε).
+            logger.info(
+                "privacy.metric_dp: anonymized {} entit{} (ε={:.1f} spent); "
+                "{} placeholders for unembeddable values",
+                len(mdp.mapping),
+                "y" if len(mdp.mapping) == 1 else "ies",
+                mdp.eps_consumed,
+                len(mdp.failures),
+            )
             new_view = replace(
                 view,
                 fidelity="RESTORED_LOSSY",
@@ -288,12 +311,16 @@ class GateKeeper:
         if not mapping:
             return response
         result = await self._restorer.restore(response, mapping)
-        if result.unmatched_keys:
-            logger.debug(
-                "privacy.restore: cloud response did not echo {} anonymized values "
-                "(may be normal if the LLM only used some of the pseudonyms): {}",
-                len(result.unmatched_keys), result.unmatched_keys,
-            )
+        # Visible breadcrumb: how many pseudonyms the cloud actually echoed
+        # back, and how many we didn't find.
+        logger.info(
+            "privacy.restore: substituted {} pseudonym occurrence{} back to original; "
+            "{} mapped value{} did not appear in the reply",
+            result.replacements_applied,
+            "" if result.replacements_applied == 1 else "s",
+            len(result.unmatched_keys),
+            "" if len(result.unmatched_keys) == 1 else "s",
+        )
         return result.restored_text
 
     # --- audit / introspection ---------------------------------------------------------

@@ -60,8 +60,13 @@ class _CLIConfirmationState:
         for i, p in enumerate(options, 1):
             marker = "[bold green]→[/bold green]" if p == rec.path else " "
             label = _path_label(p)
-            self.console.print(f"    {marker} [{i}] [bold]{p.value}[/bold] — {label}")
-        self.console.print("    [c] cancel (don't send this message)")
+            # Escape the [i] / [c] tokens so rich doesn't read them as markup
+            # tags. Without escaping, e.g. "[1]" or "[c]" would either render
+            # empty or distort the colour state of the rest of the line.
+            self.console.print(
+                f"    {marker} \\[{i}] [bold]{p.value}[/bold] — {label}"
+            )
+        self.console.print("    \\[c] cancel (don't send this message)")
         self.console.print("[dim]Press Enter to accept the recommendation.[/dim]")
 
     async def wait(self, confirmation_id: str, timeout: float) -> ConfirmationReply | None:
@@ -140,8 +145,8 @@ def _risk_color(name: str) -> str:
 def _path_label(p: ExecutionPath) -> str:
     return {
         ExecutionPath.BLOCKED: "do not send to cloud LLM",
-        ExecutionPath.SIMPLE: "answer locally (no cloud call)",
-        ExecutionPath.METRIC_DP: "send with metric-DP noise (M3, not active in M1)",
-        ExecutionPath.K_DECOY: "send k decoys + truth (M2, not active in M1)",
+        ExecutionPath.SIMPLE: "answer locally (no cloud call; requires local model — not yet wired)",
+        ExecutionPath.METRIC_DP: "send with metric-DP noise (M3, ε-dχ-privacy)",
+        ExecutionPath.K_DECOY: "send k decoys + truth (M2, not yet wired)",
         ExecutionPath.NORMAL: "send as-is to cloud LLM",
     }.get(p, "")
