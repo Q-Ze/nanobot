@@ -66,6 +66,7 @@ That alone gives you:
   "privacy": {
     "enabled": true,
     "local_model": "ollama/qwen2.5:0.5b",
+    "embedding_model": "ollama/nomic-embed-text",
     "semantic_timeout_seconds": 15,
     "risk_class_overrides": {
       "email": "low",
@@ -97,6 +98,7 @@ That alone gives you:
 | Key | Meaning |
 |---|---|
 | `local_model` | A model identifier in the same shape as `agents.defaults.model` (e.g. `"ollama/qwen2.5:0.5b"`, `"lm_studio/Qwen2.5-1.5B"`, `"anthropic/claude-haiku-4-5"`). The provider is resolved through the existing `providers.*` config blocks — no separate endpoint/auth needs to be configured here. M1.5 instantiates the backend but doesn't yet use it (SemanticDetector / K-decoy / Metric-DP arrive in M2/M3). |
+| `embedding_model` | Optional model id for the embeddings endpoint, used by Metric-DP (M3). Most chat models cannot embed; set to a dedicated embedding model such as `"ollama/nomic-embed-text"` or `"openai/text-embedding-3-small"`. When omitted, ``embed()`` reuses the chat model and most servers will return HTTP 400 — `LLMProviderBackend.embed()` then falls back to ``[]`` and downstream M3 features fail-closed. |
 | `semantic_timeout_seconds` | Per-call wall-clock cap for the LLM-backed `SemanticDetector`. Default 15 s — fits a fast local model on a workstation. Bump to 30–60 s if you point `local_model` at a slow / cloud / free-tier endpoint, otherwise the LM call silently times out and the gate falls back to regex-only detection (audible in the logs as `privacy.semantic: LM call exceeded timeout`). |
 | `risk_class_overrides` | Demote/promote a specific entity type's risk class. Use this to fix systematic false positives instead of per-message overrides. |
 | `regex_extensions` | Extra Python regex patterns that flag user-defined sensitive strings (mapped to `EntityType.OTHER`, risk class `LOW`). |

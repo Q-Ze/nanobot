@@ -4,8 +4,8 @@ import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
-from contextlib import suppress
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -288,6 +288,27 @@ class LLMProvider(ABC):
         Returns:
             LLMResponse with content and/or tool calls.
         """
+        pass
+
+    async def embed(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+    ) -> list[float]:
+        """Optional embeddings hook.
+
+        Default returns ``[]`` — providers that do not expose an embeddings
+        endpoint (Anthropic, Bedrock chat, GitHub Copilot, …) keep this
+        default and the privacy pipeline treats the absence as a non-fatal
+        capability gap. Providers backed by an OpenAI-compatible API or a
+        local server with a ``/v1/embeddings`` shim should override.
+
+        Implementations MUST be fail-closed: any transport/auth/quota error
+        is caught and returns ``[]``. Privacy decisions downstream depend
+        on this method completing.
+        """
+        return []
         pass
 
     @classmethod

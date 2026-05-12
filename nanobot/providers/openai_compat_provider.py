@@ -1112,6 +1112,45 @@ class OpenAICompatProvider(LLMProvider):
     # Public API
     # ------------------------------------------------------------------
 
+    async def embed(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+    ) -> list[float]:
+        """Call the OpenAI-compatible ``/v1/embeddings`` endpoint.
+
+        Works for Ollama (``/v1/embeddings`` shim over native
+        ``/api/embeddings``), LM Studio, vLLM with an embedding model
+        loaded, and OpenAI/Azure proper. Returns ``[]`` on any error
+        (the privacy pipeline depends on this fail-closed behaviour).
+
+        The caller is responsible for passing an *embedding* model id —
+        most local servers reject a chat model with HTTP 400.
+        """
+        if not text:
+            return []
+        target_model = model or self.default_model
+        try:
+            response = await self._client.embeddings.create(
+                input=text, model=target_model
+            )
+        except Exception as exc:  # noqa: BLE001
+            from loguru import logger as _logger
+            _logger.debug(
+                "embed() failed via {}: {!r}",
+                getattr(self, "_effective_base", "?"), exc,
+            )
+            return []
+        try:
+            data = response.data
+            if not data:
+                return []
+            vector = data[0].embedding
+            return list(vector) if vector is not None else []
+        except (AttributeError, IndexError, TypeError):
+            return []
+
     async def chat(
         self,
         messages: list[dict[str, Any]],

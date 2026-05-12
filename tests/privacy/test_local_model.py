@@ -129,9 +129,41 @@ async def test_llm_provider_backend_coerces_block_content():
     assert await backend.generate("any") == "ab"
 
 
-async def test_llm_provider_backend_embed_returns_empty():
+async def test_llm_provider_backend_embed_returns_empty_when_text_empty():
     backend = LLMProviderBackend(provider=MagicMock(), model="x")
-    assert await backend.embed("anything") == []
+    assert await backend.embed("") == []
+
+
+async def test_llm_provider_backend_embed_calls_provider_with_chat_model_by_default():
+    provider = MagicMock()
+    provider.embed = AsyncMock(return_value=[0.1, 0.2, 0.3])
+    backend = LLMProviderBackend(provider=provider, model="ollama/qwen2.5:0.5b")
+
+    result = await backend.embed("hello world")
+
+    assert result == [0.1, 0.2, 0.3]
+    provider.embed.assert_awaited_once_with("hello world", model="ollama/qwen2.5:0.5b")
+
+
+async def test_llm_provider_backend_embed_honours_embedding_model_override():
+    provider = MagicMock()
+    provider.embed = AsyncMock(return_value=[0.5, 0.6])
+    backend = LLMProviderBackend(
+        provider=provider,
+        model="ollama/qwen2.5:0.5b",
+        embedding_model="ollama/nomic-embed-text",
+    )
+
+    await backend.embed("text")
+
+    provider.embed.assert_awaited_once_with("text", model="ollama/nomic-embed-text")
+
+
+async def test_llm_provider_backend_embed_swallows_exceptions():
+    provider = MagicMock()
+    provider.embed = AsyncMock(side_effect=RuntimeError("backend down"))
+    backend = LLMProviderBackend(provider=provider, model="x")
+    assert await backend.embed("text") == []
 
 
 # --- build_from_root_config -----------------------------------------------------------
@@ -155,6 +187,7 @@ def test_build_returns_backend_when_configured(monkeypatch):
     root = MagicMock()
     root.privacy.enabled = True
     root.privacy.local_model = "ollama/qwen2.5:0.5b"
+    root.privacy.embedding_model = None
 
     fake_provider = MagicMock()
 
@@ -175,6 +208,7 @@ def test_build_returns_none_when_provider_factory_raises(monkeypatch):
     root = MagicMock()
     root.privacy.enabled = True
     root.privacy.local_model = "bogus/x"
+    root.privacy.embedding_model = None
 
     def boom(config, *, model_override=None):
         raise ValueError("no api key")
@@ -182,3 +216,56 @@ def test_build_returns_none_when_provider_factory_raises(monkeypatch):
     monkeypatch.setattr("nanobot.providers.factory.make_provider", boom)
     # Misconfiguration must not crash the agent loop — fall back to None.
     assert build_from_root_config(root) is None
+
+
+def test_build_uses_separate_embedding_provider(monkeypatch):
+    root = MagicMock()
+    root.privacy.enabled = True
+    root.privacy.local_model = "ollama/qwen2.5:0.5b"
+    root.privacy.embedding_model = "ollama/nomic-embed-text"
+
+    chat = MagicMock(name="chat_provider")
+    embed = MagicMock(name="embed_provider")
+    embed.embed = AsyncMock(return_value=[0.1, 0.2])
+    calls: list[str] = []
+
+    def fake_make_provider(config, *, model_override=None):
+        calls.append(model_override)
+        return chat if model_override == "ollama/qwen2.5:0.5b" else embed
+
+    monkeypatch.setattr(
+        "nanobot.providers.factory.make_provider", fake_make_provider
+    )
+    backend = build_from_root_config(root)
+    assert backend is not None
+    # Both providers were resolved.
+    assert "ollama/qwen2.5:0.5b" in calls
+    assert "ollama/nomic-embed-text" in calls
+
+    import asyncio
+    out = asyncio.get_event_loop().run_until_complete(backend.embed("hello"))
+    assert out == [0.1, 0.2]
+    embed.embed.assert_awaited_once_with("hello", model="ollama/nomic-embed-text")
+
+
+def test_build_falls_back_to_no_embeddings_when_embedding_provider_fails(monkeypatch):
+    root = MagicMock()
+    root.privacy.enabled = True
+    root.privacy.local_model = "ollama/qwen2.5:0.5b"
+    root.privacy.embedding_model = "ollama/nomic-embed-text"
+
+    chat = MagicMock(name="chat_provider")
+    chat.embed = AsyncMock(return_value=[])
+
+    def fake_make_provider(config, *, model_override=None):
+        if model_override == "ollama/qwen2.5:0.5b":
+            return chat
+        raise RuntimeError("embedding provider misconfigured")
+
+    monkeypatch.setattr("nanobot.providers.factory.make_provider", fake_make_provider)
+    backend = build_from_root_config(root)
+    assert backend is not None
+    # Chat path still works; embed path silently returns [].
+    import asyncio
+    out = asyncio.get_event_loop().run_until_complete(backend.embed("hello"))
+    assert out == []

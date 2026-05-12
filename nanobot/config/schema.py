@@ -335,6 +335,7 @@ class PrivacyConfig(Base):
 
     enabled: bool = False  # off by default; opt-in until detector recall is validated
     local_model: str | None = None  # e.g. "ollama/qwen2.5:0.5b"; resolves via providers.*
+    embedding_model: str | None = None  # e.g. "ollama/nomic-embed-text"; used by M3 Metric-DP
     semantic_timeout_seconds: float = Field(
         default=15.0, gt=0, le=120.0,
     )  # Per-call timeout for the LLM-backed SemanticDetector; bump for slow / cloud backends.
