@@ -1550,6 +1550,20 @@ class AgentLoop:
         if isinstance(outcome.privacy_message, str) and outcome.privacy_message != ctx.msg.content:
             ctx.msg = dataclasses.replace(ctx.msg, content=outcome.privacy_message)
         ctx.privacy_outcome = outcome
+
+        # METRIC_DP responses must be restored AFTER the cloud finishes —
+        # streaming would expose the pseudonyms to the user terminal long
+        # before that restore happens. Suppress the on_stream callback
+        # for this turn so the only display path is _print_agent_response
+        # against the already-restored ctx.final_content. The trade-off
+        # is no incremental token rendering for METRIC_DP turns; we judge
+        # that worth it over leaking pseudonyms onto the screen.
+        from nanobot.privacy.types import ExecutionPath as _Path2
+
+        if decision.path == _Path2.METRIC_DP:
+            ctx.on_stream = None
+            ctx.on_stream_end = None
+
         return "ok"
 
     @staticmethod
