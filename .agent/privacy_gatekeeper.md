@@ -1,8 +1,9 @@
 # Privacy GateKeeper — Design Spec
 
-> 状态：设计稿 v1.1（2026-05-11）。本文聚焦**机制可证明性**与**集成边界**，不含实现代码。
+> 状态：设计稿 v1.2（2026-05-12）。本文聚焦**机制可证明性**与**集成边界**。
 > 范围：在 `AgentLoop` 入口处对用户消息做隐私检测、路径选择、（可选）用户确认、脱敏、出云、还原；并维护可审计的隐私会计。
-> v1.1 变更：引入 `ConfirmationGate`，允许用户在系统推荐之上交互式选择执行路径。
+> v1.1 → v1.2 变更：M1 / M1.5 / M3 实现已发货；本文档保留作为规格基线。
+> 用户向使用指南见 [`docs/privacy-gatekeeper-m1.md`](../docs/privacy-gatekeeper-m1.md)。
 
 ---
 
@@ -369,29 +370,37 @@ confirmation:
 
 ## 6. 数学保证总结（诚实陈述）
 
-| 路径 | 形式化保证 | 假设 |
-|---|---|---|
-| BLOCKED | 信息不出域 | 端侧不被攻陷 |
-| SIMPLE | 信息不出域 | 同上 |
-| METRIC_DP | (ε)-dχ-privacy on transformed tokens；会话累计 ε 由 accountant 控制 | 攻击者无端侧密钥；噪声采样器正确实现；最近邻投影是后处理 |
-| K_DECOY | 计算性可否认：单条消息上区分器优势 ≤ 1/k − 1/2 + adv(prior) | 攻击者多项式时间；诱饵分布与真实分布 TV 距离小；无跨轮重复 |
-| NORMAL | **无保护**（按定义） | 已经判定无隐私实体；接受路由侧信道 |
+| 路径 | 形式化保证 | 实现状态 | 假设 |
+|---|---|---|---|
+| BLOCKED | 信息不出域 | ✅ shipped (M1) | 端侧不被攻陷 |
+| SIMPLE | 信息不出域 | ⚠️ 接口存在，路径默认禁用（`local_model_available=False`） | 同上 |
+| METRIC_DP | (ε)-dχ-privacy on transformed tokens；(ε_session, ε_user_24h) 由 PrivacyAccountant 强制；超预算 fail-closed | ✅ shipped (M3) — 已经实测真实 OpenAI embedding | 攻击者无端侧密钥；候选池 embedding 与原 token 共享同一 embedding model；Laplace 采样器实现正确（经验证：与理论 Gamma(d, 1/ε) 矩匹配，dχ-privacy 经验边界通过）；最近邻投影是后处理 |
+| K_DECOY | 计算性可否认：单条消息上区分器优势 ≤ 1/k − 1/2 + adv(prior) | ⏳ 未实现（M2，已降级为可选 fast-path） | 攻击者多项式时间；诱饵分布与真实分布 TV 距离小；无跨轮重复 |
+| NORMAL | **无保护**（按定义） | ✅ shipped (M1) | 已判定无隐私实体；接受路由侧信道 |
 
-**已知未解决问题（v2 候选）**：
-1. 工具输出（filesystem/MCP）含隐私时的统一处理；
-2. 流式响应下的还原（当前设计假设全量响应）；
-3. 多语言 NER 的 recall 长尾；
-4. 与 `MyTool` 自修改能力的交互（agent 改自身 prompt 时如何不绕过 GateKeeper）。
+**M3 实测验证（2026-05-12）**：
+- 真实 OpenAI `text-embedding-3-small` 1536D 向量经 OpenRouter 拿到，cosine 排序符合直觉。
+- `alice@x.com` 端到端被替换为候选池中的某个邮箱，云端 echo 后 Restorer 正确还原。
+- ε=8.0 真实记录到 accountant；预算耗尽时决策器正确 fail-closed 到 BLOCKED。
+- 7 个端到端集成测试覆盖完整 pipeline 状态机。
+
+**已知未解决问题（M4+ 候选）**：
+1. 工具输出（filesystem / MCP / web fetch）含隐私时的统一处理 — agent 当前可读取本地文件并直接送云端。
+2. 流式响应下的还原 — 当前设计假设全量响应；流式 token-by-token 还原会让攻击者通过响应到达时序部分推断。
+3. 多语言 NER 的 recall 长尾 — `LLMSemanticDetector` 依赖 prompt 内容里的 category 列表，小模型对低资源语言可能漏报。
+4. LM-assisted Restorer rewriting — 云端把 "Bob" 改写成 "Robert" 会让字符串级 restore 漏过；hook 已留接口（`backend=`, `use_llm_rewrite=`）但未实现。
+5. 与 `MyTool` 自修改能力的交互 — agent 改自身 prompt 时如何不绕过 GateKeeper。
 
 ---
 
 ## 7. 实施分期
 
-- **M1**：检测器（正则 + 小模型）+ 决策器（推荐 + AllowedSet）+ ConfirmationGate（含 `mode`、超时、channel fallback）+ BLOCKED + SIMPLE + NORMAL + 审计记录；不含 K_DECOY/METRIC_DP。
-  - 理由：确认机制是用户主权的基础能力，应与检测同步上线；否则 M1 上线后用户无法在不可证明路径之外做选择。
-- **M2**：伪名层 + K_DECOY + accountant 骨架。
-- **M3**：METRIC_DP（dχ-privacy）实现 + 还原层 + UI 标注（`fidelity`、`path_source`、ε 消耗）。
-- **M4**：路由侧信道缓解 + 信封加密审计 + tool-output 检查。
+- **M1** ✅ shipped — 检测器（正则）+ 决策器（推荐 + AllowedSet）+ ConfirmationGate（三种 mode、超时、channel fallback）+ BLOCKED + NORMAL + 审计记录。
+- **M1.5** ✅ shipped — SIMPLE stub 收口；`LocalModelBackend` 抽象 + `LLMProviderBackend` 适配器；CLI + WebSocket 交互确认；`local_model` 通过现有 `providers.*` 注册表；`LLMSemanticDetector` 自动 wire；`OpenAICompatProvider.embed` + 非规范 JSON httpx fallback。
+- **M3** ✅ shipped — Multivariate Laplace 采样器 + token-level dχ-privacy `MetricDPTransform` + `PrivacyAccountant`（(ε_session, ε_user_24h) + 滑动窗口 + 持久化）+ `Restorer`（两段 sentinel 替换）+ GateKeeper / AgentLoop 端到端集成（含决策器 metric_dp_supported 动态判断）。已对真实 OpenAI embedding（经 OpenRouter）端到端验证。
+- **M2** 未开始 — 伪名层（HMAC-SHA256 with session key）+ K_DECOY 诱饵生成 + accountant 与 M3 共享。**降级为"可选 fast-path"**：原设计把 K-decoy 看作"少 ε 时的备选"，但实际 Metric-DP 提供更强保证，绝大多数用户应优先用 M3。
+- **M4** 未开始 — 路由侧信道缓解（`routing_mode: balanced` + cover-traffic randomisation）；信封加密审计（KMS / age recipient 已留 `audit.kms_recipient` 配置位）；工具输出 PII 扫描（agent 读取的文件/MCP/web fetch 当前都直接出云）；MyTool 自修改防护。
+- **WebUI** 未开始 — 渲染 `privacy_confirmation` envelope 弹窗。协议侧已就绪 + 测试覆盖；纯前端 PR。
 
 每期独立 PR，符合 `.agent/design.md` 的 "minimal change" 与 "keep PRs reviewable" 约束。
 

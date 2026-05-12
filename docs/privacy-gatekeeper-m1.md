@@ -1,95 +1,124 @@
-# Privacy GateKeeper — M1 Release Notes
+# Privacy GateKeeper — Release Notes & Usage Guide
 
-> **Status:** M1 shipped 2026-05-11. See `.agent/privacy_gatekeeper.md` for the full
-> design spec, `add_new_fuction.md` for the original requirements.
+> **Status:** M3 shipped 2026-05-12. The full Metric-DP pipeline runs
+> end-to-end: a configured nanobot agent can now anonymise sensitive
+> entities, send the anonymised text to a cloud LLM, and restore the
+> original values in the reply — with a provable (ε)-dχ-privacy
+> guarantee on the anonymisation step.
+>
+> Design spec: [`.agent/privacy_gatekeeper.md`](../.agent/privacy_gatekeeper.md).
 
-This document summarizes what M1 added to the codebase, how to enable it, and
-how to test it locally. M1 is the **foundation milestone**: detector, decider,
-confirmation flow, audit, and AgentLoop integration. It does **not** include
-K-decoy or Metric-DP transformations — those arrive in M2/M3.
+This document describes what's shipped, how to enable it, how to test
+it locally, and what's intentionally left for future milestones.
 
 ---
 
-## 1. What was added
+## 1. What's in the box
 
-### 1.1 New module: `nanobot/privacy/`
+### 1.1 The `nanobot/privacy/` module
 
 | File | Purpose |
 |---|---|
-| `types.py` | Shared enums + dataclasses (`ExecutionPath`, `RiskClass`, `EntityType`, `Decision`, `Recommendation`, `ChannelCapabilities`, …) and strictness-ordering helpers. |
-| `detector.py` | `PrivacyEntityDetector`: regex layer (email, phone E.164 + CN, CN ID number with checksum, bank card with Luhn, IP, cloud credentials, JWT, SSH/PEM, high-entropy strings) + pluggable semantic LM hook (defaults to no-op). |
-| `decider.py` | `ExecutionDecider`: pure function `inputs → Recommendation(path, allowed_set, reason)`. Implements the §3.2 decision tree and the §4.5 safety-floor matrix. |
-| `confirmation.py` | `ConfirmationGate`: handles `mode ∈ {always, risk_threshold, never}`, user pre-selection, interactive ask with timeout, channel-fallback policies. |
-| `audit.py` | `AuditLogger`: append-only JSONL. **Never writes raw entity values.** Stores `path / recommended_path / source / entity_counts / risk_counts / latency / downgrade_flag`. |
-| `gate.py` | `GateKeeper` facade — single import surface used by `AgentLoop`. |
+| `types.py` | Shared enums + dataclasses (`ExecutionPath`, `RiskClass`, `EntityType`, `Decision`, `Recommendation`, `ChannelCapabilities`, `TransformOutcome`, `AuditView`, …) and strictness ordering. |
+| `detector.py` | `PrivacyEntityDetector` — regex layer (email, phone E.164 + CN, CN ID checksum, bank card Luhn, IP, cloud credentials, JWT, SSH/PEM, high-entropy) + pluggable semantic-detector hook. |
+| `semantic_detector.py` | `LLMSemanticDetector` — second-pass LM-backed detector for names / addresses / medical terms that regex can't catch. Auto-wired when a backend is configured. |
+| `decider.py` | `ExecutionDecider` — pure function inputs → `Recommendation(path, allowed_set, reason)`. Implements §3.2 decision tree and §4.5 safety floor. |
+| `confirmation.py` | `ConfirmationGate` — three modes (`always` / `risk_threshold` / `never`), user pre-selection (with silent floor enforcement), interactive ask with timeout, channel-fallback policies. |
+| `audit.py` | `AuditLogger` — append-only JSONL, metadata only (no raw entity values), atomic + fsync. |
+| `local_model.py` | `LocalModelBackend` protocol, `NullLocalModel`, `LLMProviderBackend` adapter that wraps any nanobot `LLMProvider` for chat + embeddings. |
+| `metric_dp.py` | Multivariate Laplace sampler `laplace_noise(d, ε)` — polar decomposition (uniform direction on S^(d-1) × Gamma(d, 1/ε) radius) gives density ∝ exp(-ε‖η‖₂). |
+| `transform.py` | `MetricDPTransform` — for each entity: embed → +Laplace noise → nearest neighbour in a typed candidate pool → swap; emits a restoration mapping. |
+| `accountant.py` | `PrivacyAccountant` — basic linear composition of ε across `(ε_session, ε_user_24h)`; raises `BudgetExceeded` on overflow; user-id hashed on disk. |
+| `restorer.py` | `Restorer` — two-pass deterministic anti-substitution with sentinels and ASCII-vs-non-ASCII boundary handling. |
+| `gate.py` | `GateKeeper` facade — `detect_and_recommend` → `confirm` → `transform` → `restore`. Auto-wires the components from `PrivacyConfig`. |
+| `cli_channel_caps.py` | CLI-channel `ChannelCapabilities` factory — interactive confirmation via stdin/stdout. |
 
-### 1.2 Modified files
+### 1.2 Touched files outside the module
 
-| File | Change |
+| File | What changed |
 |---|---|
-| `nanobot/config/schema.py` | New `PrivacyConfig` (+ four sub-configs) added to root `Config`. Defaults are off; nothing changes for existing users until they set `privacy.enabled = true`. |
-| `nanobot/channels/base.py` | Two new attributes (`privacy_supports_interactive_confirm`, `privacy_confirmation_max_latency_seconds`) and `privacy_capabilities()` hook for channels to declare interactive-confirmation support. Default is non-interactive. |
-| `nanobot/agent/loop.py` | Added `TurnState.GATE` between `COMMAND` and `BUILD`, new `_state_gate` handler, transitions, and `privacy_config` constructor parameter. Existing state handlers are untouched. |
+| `nanobot/config/schema.py` | `PrivacyConfig` (+ 4 sub-configs: `confirmation`, `audit`, `k_decoy`, `metric_dp`), `local_model`, `embedding_model`, `semantic_timeout_seconds`. |
+| `nanobot/agent/loop.py` | New `TurnState.GATE` between COMMAND and BUILD; `_state_gate` runs the GateKeeper, `_state_run` calls `gate.restore` on the cloud response. `TurnContext` gains `privacy_outcome`. |
+| `nanobot/channels/base.py` | `privacy_capabilities()` hook + two flag attributes. Default returns non-interactive. |
+| `nanobot/channels/websocket.py` | Implements `privacy_capabilities()` with a real `send_confirmation` / `await_confirmation_reply` bridge backed by `asyncio.Future` + a new `privacy_confirmation` / `privacy_confirmation_reply` envelope pair. |
+| `nanobot/providers/base.py` | `LLMProvider.embed(text, model=...) → list[float]`; default returns `[]`. |
+| `nanobot/providers/openai_compat_provider.py` | Overrides `embed()` to call `/v1/embeddings`; transparent httpx fallback for non-canonical JSON responses (e.g. OpenRouter free-tier keep-alive prefix). |
+| `nanobot/providers/factory.py` | `make_provider(config, *, model_override=…)` so a second provider can be built for the privacy model without disturbing the main agent. |
+| `nanobot/cli/commands.py` | `nanobot agent` registers CLI `ChannelCapabilities` so the gate's confirmation prompt renders in the terminal. |
 
-### 1.3 Tests (`tests/privacy/`)
+### 1.3 Tests
 
-43 unit tests across four files: detector, decider, confirmation, gate+audit.
-All run synchronously without network or LLM calls.
+| Module | Cases |
+|---|---|
+| `tests/privacy/test_detector.py` | 19 (regex coverage, Luhn / CN-ID checksum, high-entropy, overrides, regex extensions, overlap merge, semantic injection). |
+| `tests/privacy/test_decider.py` | 9 (recommendation table + AllowedPathSet floor). |
+| `tests/privacy/test_confirmation.py` | 11 (three modes, preselect floor, timeout, channel fallback overrides). |
+| `tests/privacy/test_gate_and_audit.py` | 8 (audit no-raw, audit disabled, façade end-to-end). |
+| `tests/privacy/test_local_model.py` | 16 (protocol, registry, LLMProviderBackend incl. embedding-model override, factory build paths). |
+| `tests/privacy/test_semantic_detector.py` | 22 (parser, span resolution, hallucination guard, fail-closed branches, auto-wiring through GateKeeper). |
+| `tests/privacy/test_metric_dp.py` | 18 (input validation, Gamma moments, isotropy, off-diagonal covariance, ε-vs-noise inverse, **empirical dχ-privacy bound**, determinism). |
+| `tests/privacy/test_transform.py` | 11 (no-op, high-ε convergence, low-ε spread, placeholder fail-closed paths, original-excluded-from-pool, multi-entity span splicing, UTF-8). |
+| `tests/privacy/test_accountant.py` | 28 (empty / consume / overflow without partial state / sliding 24h window / persistence / on-disk user-id hashed / atomic temp file / forward-compat JSON shape). |
+| `tests/privacy/test_restorer.py` | 20 (chain-replacement protection, lookaround boundary, Chinese, case-sensitive, unmatched reporting, **roundtrip with MetricDPTransform**). |
+| `tests/privacy/test_gate_integration.py` | 7 (full METRIC_DP pipeline; NORMAL skips transform; session budget exhaustion; user_24h cap across sessions; reset_session refills; no-backend falls back; audit fidelity & eps_consumed). |
+| `tests/channels/test_websocket_privacy_confirmation.py` | 10 (wire protocol broadcast, reply, cancel, timeout, invalid path, unknown id, stop-cancels-pending). |
+| `tests/providers/test_embed.py` | 11 (embed happy path, default-model fallback, transport errors, OpenRouter whitespace-prefix httpx fallback). |
+
+**Total: ~190 dedicated privacy tests, all green; 1726 in the full suite.**
 
 ---
 
 ## 2. Enable & use
 
-### 2.1 Opt-in (default: off)
-
-Privacy GateKeeper is **disabled by default**. Edit `~/.nanobot/config.json`:
+### 2.1 Minimal opt-in (default: off)
 
 ```json
 {
-  "privacy": {
-    "enabled": true
-  }
+  "privacy": { "enabled": true }
 }
 ```
 
-That alone gives you:
-- All catastrophic entities (API keys, SSH keys, JWT, internal instructions) **hard-blocked** before reaching the cloud LLM.
-- All HIGH-risk entities (CN ID, bank card, medical, high-entropy strings) **blocked** in M1 (M3 will route them to Metric-DP).
-- All MEDIUM-risk entities (email, phone, name, address) **blocked** in M1 (M2 will route them to K-decoy).
-- LOW-risk and entity-free messages pass through unchanged.
-- All decisions logged to `~/.nanobot/privacy_audit/audit-YYYYMMDD.jsonl`.
+What that alone gives you (no backend → no LM detection, no Metric-DP):
+- CATASTROPHIC entities (API keys, SSH/PEM, JWT, …) **hard-blocked**.
+- HIGH entities (CN ID, bank card, medical, high-entropy strings) **blocked**.
+- MEDIUM entities (email, phone, name, address) **blocked** — fail-closed because there's no anonymisation path wired.
+- LOW entities and entity-free messages pass through unchanged.
+- Audit JSONL written to `~/.nanobot/privacy_audit/audit-YYYYMMDD.jsonl`.
 
-### 2.2 Full configuration surface
+### 2.2 Full configuration with Metric-DP enabled
 
 ```json
 {
+  "agents": {
+    "defaults": { "model": "anthropic/claude-opus-4-5" }
+  },
+  "providers": {
+    "anthropic": { "api_key": "sk-ant-..." },
+    "openrouter": { "api_key": "sk-or-..." }
+  },
   "privacy": {
     "enabled": true,
-    "local_model": "ollama/qwen2.5:0.5b",
-    "embedding_model": "ollama/nomic-embed-text",
-    "semantic_timeout_seconds": 15,
-    "risk_class_overrides": {
-      "email": "low",
-      "ip": "medium"
-    },
-    "regex_extensions": [
-      "INTERNAL-\\d{6}"
-    ],
+    "local_model": "minimax/minimax-m2.5:free",
+    "embedding_model": "openai/text-embedding-3-small",
+    "semantic_timeout_seconds": 60,
+    "risk_class_overrides": { "ip": "low" },
+    "regex_extensions": ["INTERNAL-\\d{6}"],
     "routing_mode": "conservative",
     "confirmation": {
       "mode": "risk_threshold",
       "risk_threshold": "high",
       "timeout_seconds": 60,
       "on_timeout": "block",
-      "channel_fallback_default": "forced_conservative",
-      "channel_fallback_overrides": {
-        "webhook": "use_recommended",
-        "email_bridge": "reject"
-      }
+      "channel_fallback_default": "forced_conservative"
     },
     "audit": {
       "enabled": true,
       "log_dir": "~/.nanobot/privacy_audit"
+    },
+    "metric_dp": {
+      "eps_query": 8.0,
+      "eps_session_max": 32.0,
+      "eps_user_24h_max": 64.0
     }
   }
 }
@@ -97,76 +126,98 @@ That alone gives you:
 
 | Key | Meaning |
 |---|---|
-| `local_model` | A model identifier in the same shape as `agents.defaults.model` (e.g. `"ollama/qwen2.5:0.5b"`, `"lm_studio/Qwen2.5-1.5B"`, `"anthropic/claude-haiku-4-5"`). The provider is resolved through the existing `providers.*` config blocks — no separate endpoint/auth needs to be configured here. M1.5 instantiates the backend but doesn't yet use it (SemanticDetector / K-decoy / Metric-DP arrive in M2/M3). |
-| `embedding_model` | Optional model id for the embeddings endpoint, used by Metric-DP (M3). Most chat models cannot embed; set to a dedicated embedding model such as `"ollama/nomic-embed-text"` or `"openai/text-embedding-3-small"`. When omitted, ``embed()`` reuses the chat model and most servers will return HTTP 400 — `LLMProviderBackend.embed()` then falls back to ``[]`` and downstream M3 features fail-closed. |
-| `semantic_timeout_seconds` | Per-call wall-clock cap for the LLM-backed `SemanticDetector`. Default 15 s — fits a fast local model on a workstation. Bump to 30–60 s if you point `local_model` at a slow / cloud / free-tier endpoint, otherwise the LM call silently times out and the gate falls back to regex-only detection (audible in the logs as `privacy.semantic: LM call exceeded timeout`). |
-| `risk_class_overrides` | Demote/promote a specific entity type's risk class. Use this to fix systematic false positives instead of per-message overrides. |
-| `regex_extensions` | Extra Python regex patterns that flag user-defined sensitive strings (mapped to `EntityType.OTHER`, risk class `LOW`). |
-| `confirmation.mode` | `always` = ask every relevant turn; `risk_threshold` (default) = only when risk ≥ threshold or path is non-trivial; `never` = silent automated decisions. |
-| `confirmation.on_timeout` | `block` (default, fail-closed) or `recommended` (use system suggestion when user is slow). |
-| `channel_fallback_*` | What to do on channels that can't ask interactively. `forced_conservative` = pick the strictest path in the allowed set; `use_recommended` = trust the system suggestion; `reject` = bounce the message. |
+| `local_model` | Model id (e.g. `"ollama/qwen2.5:0.5b"` or `"minimax/minimax-m2.5:free"`) used by `LLMSemanticDetector` for second-pass entity detection. Resolves through the existing `providers.*` blocks. |
+| `embedding_model` | Model id used by `MetricDPTransform` for embeddings (e.g. `"ollama/nomic-embed-text"`, `"openai/text-embedding-3-small"`). Most chat models cannot embed — set a dedicated embedding model. When unset, `LLMProviderBackend.embed()` reuses the chat model and most servers reject it; the gate then falls back to BLOCKED for MEDIUM/HIGH entities. |
+| `semantic_timeout_seconds` | Per-call wall-clock cap for the LM-backed `SemanticDetector`. Default 15 s — bump to 30–60 s for slow / cloud / free-tier endpoints. Visible in logs as `privacy.semantic: LM call exceeded timeout`. |
+| `metric_dp.eps_query` | ε spent per Metric-DP transform. Default 8 (utility-leaning); set to 1 for strong-DP. |
+| `metric_dp.eps_session_max` | Total ε a session can spend before further METRIC_DP turns block. |
+| `metric_dp.eps_user_24h_max` | Same, rolling 24-hour window per user (persists to disk). |
+| `risk_class_overrides` | Demote / promote a category's risk class to fix systematic false positives. |
+| `regex_extensions` | Extra Python regex patterns flagging user-defined sensitive strings. |
+| `confirmation.mode` | `always` / `risk_threshold` (default) / `never`. |
+| `confirmation.on_timeout` | `block` (default, fail-closed) or `recommended`. |
+| `channel_fallback_*` | Behaviour on channels that can't ask interactively. |
 
-**Local model selection.** If `local_model` is set, the GateKeeper builds
-an `LLMProviderBackend` using the same `make_provider` machinery that
-constructs the main agent provider. You configure auth/endpoint exactly
-where you already do — e.g. `providers.ollama.api_base` for an Ollama
-endpoint. Pointing `local_model` at a cloud model (Anthropic, OpenAI…)
-is supported too; "local" here is a role, not a hard locality requirement.
+**Local can be cloud.** `local_model` and `embedding_model` are *roles*, not hard locality requirements. Pointing them at OpenAI/Anthropic/OpenRouter works; the privacy guarantee then assumes the embedding provider is part of your trust boundary.
 
 ### 2.3 User-supplied path preference (SDK / power users)
 
-Any caller can supply `metadata["privacy_path"]` in the inbound message to
-pre-select a path. Allowed values: `"normal" | "simple" | "k_decoy" | "metric_dp" | "blocked"`.
-
-**Safety floor still applies:** if your pre-selection violates the safety floor
-(e.g. you ask for `normal` on a message containing a CATASTROPHIC entity),
-the GateKeeper silently overrides to the system recommendation and records
-`violation_attempt` in the audit log — it will not raise or leak which rule
-you tripped.
-
-Example (Python SDK):
-
-```python
-from nanobot.bus.events import InboundMessage
-
-msg = InboundMessage(
-    channel="cli",
-    sender_id="alice",
-    chat_id="direct",
-    content="My email is alice@example.com — help me draft a reply.",
-    metadata={"privacy_path": "blocked"},   # user explicitly chooses to NOT send
-)
-```
+Set `metadata["privacy_path"]` on the inbound message to one of
+`"normal" | "simple" | "k_decoy" | "metric_dp" | "blocked"` — the gate
+honours the preference if it satisfies the safety floor, otherwise silently
+overrides to the system recommendation and records `violation_attempt` in
+the audit log.
 
 ---
 
-## 3. What you'll see at runtime
+## 3. Runtime behaviour
 
-### 3.1 A blocked turn
+### 3.1 A blocked turn (CATASTROPHIC)
 
-User input: `"My API key is sk-ant-abc123… please test it"`
-
-Outbound message content:
 ```
-Privacy GateKeeper blocked this message. Reason: hard_secret:credential.
-Please remove the sensitive content and try again.
+$ nanobot agent -m "my api key is sk-ant-test12345"
+
+🛡  Privacy GateKeeper
+  Detected entities:
+    • credential catastrophic 'sk-ant-test12345'
+  Recommended: blocked (hard_secret:credential)
+  Options:
+    → [1] blocked — do not send to cloud LLM
+    [c]  cancel (don't send this message)
+Choose [number / c / Enter]: ↵
+[blocked] Privacy GateKeeper blocked this message. Reason: hard_secret:credential.
 ```
 
-The cloud LLM is **never called**. The decision goes through `_state_gate → DONE`.
+The cloud LLM is **never called**.
 
-### 3.2 A passing turn (no entities or LOW only)
+### 3.2 A METRIC_DP turn (MEDIUM entity, full pipeline)
 
-User input: `"What's the capital of France?"`
+```
+$ nanobot agent -m "Please email alice@x.com about tomorrow."
 
-GateKeeper attaches `msg.metadata["privacy"] = {path: "normal", recommended_path: "normal", source: "system_auto", fidelity: "EXACT"}` and forwards the message unchanged. The cloud LLM call proceeds normally.
+🛡  Privacy GateKeeper
+  Detected entities:
+    • email medium 'alice@x.com'
+  Recommended: metric_dp (recommended_metric_dp)
+  Options:
+    → [1] metric_dp — send with metric-DP noise
+       [2] blocked   — do not send to cloud LLM
+Choose [number / Enter]: ↵
+[transform] alice@x.com → jamie.singh@example.io  (ε=8.0, fidelity=RESTORED_LOSSY)
+[cloud]     "Sure, I'll draft an email to jamie.singh@example.io about ..."
+[restore]   "Sure, I'll draft an email to alice@x.com about ..."
+[audit]     path=metric_dp eps_consumed=8.0 session_remaining=24.0
+```
 
-### 3.3 Audit log entry
+The cloud LLM saw `jamie.singh@example.io`; the user sees `alice@x.com`.
+
+### 3.3 A passing turn (no entities or LOW only)
+
+The gate is invisible — no prompt, no rewrite. The message metadata
+acquires a tiny `privacy: {path: "normal", source: "system_auto", …}`
+hint and an audit JSONL line records "no entity detected".
+
+### 3.4 Audit log entry
 
 ```jsonl
-{"decision_reason": "hard_secret:credential", "entity_counts": {"credential": 1}, "eps_consumed": 0.0, "fidelity": "EXACT", "path": "blocked", "path_source": "system_auto", "recommended_path": "blocked", "risk_counts": {"catastrophic": 1}, "session_id_hash": "1a2b3c…", "ts": "2026-05-11T12:34:56.789+00:00", "user_choice_latency_ms": null, "user_downgrade": false, "violation_attempt": null}
+{
+  "ts": "2026-05-12T04:06:41.945+00:00",
+  "session_id_hash": "1a2b3c4d5e6f7890",
+  "path": "metric_dp",
+  "recommended_path": "metric_dp",
+  "path_source": "user_confirmed",
+  "user_choice_latency_ms": 2200,
+  "violation_attempt": null,
+  "user_downgrade": false,
+  "entity_counts": {"email": 1},
+  "risk_counts": {"medium": 1},
+  "decision_reason": "recommended_metric_dp",
+  "fidelity": "RESTORED_LOSSY",
+  "eps_consumed": 8.0
+}
 ```
 
-Note: **`value` of the credential is NOT in the log line.** Only counts and types are.
+Original entity value (`alice@x.com`) is **not** in this line.
 
 ---
 
@@ -174,255 +225,188 @@ Note: **`value` of the credential is NOT in the log line.** Only counts and type
 
 ### 4.0 Quick triage when "it's not triggering"
 
-If you opt the gate in and your test message doesn't trigger anything,
-run the diagnostic script — it walks the pipeline layer by layer and
-prints what each one returned (config → backend → smoke test → detector
-→ semantic-LM raw call → decider → confirmation → transformer):
+Run the diagnostic — walks the pipeline layer by layer:
 
 ```bash
 python scripts/debug_privacy.py \
-  --config /root/.nanobot/config.json \
+  --config ~/.nanobot/config.json \
   -m "Hello, my api key is sk-xsadsafsgdrghr"
 ```
 
+It prints each layer's state (config → backend → smoke test → detector
+→ semantic-LM raw call → decider → confirmation → transformer → embeddings).
 Common findings and fixes:
 
-| What the script shows | Likely cause | Fix |
+| Diagnostic output | Cause | Fix |
 |---|---|---|
-| `privacy.enabled = False` at step 1 | Config not opted in | Set `privacy.enabled = true` in `config.json` |
-| step 2 prints `✗ build_from_root_config returned None` with `local_model` set | Provider auth/api_base missing for that model | Configure the matching `providers.<name>` block (see §2.2) |
-| step 2 smoke test returns `''` | Backend reachable but model not pulled / wrong name | Pull the model (e.g. `ollama pull qwen2.5:0.5b`) or fix the model id |
-| step 3 finds no entities, step 3b raw response shows valid JSON, but it dropped to "hallucination" | The LM rephrased the value (common with very small Chinese-name detectors) | Try a stronger model or relax via custom `SemanticDetector` |
-| step 3b shows `Error: ... 429 ... rate-limited` | Free-tier upstream throttling | Add your own provider key or switch model |
-| step 3 finds nothing AND step 3b shows empty response | LM call timed out silently | Increase `privacy.semantic_timeout_seconds` in config (default 15 s) |
+| `privacy.enabled = False` at step 1 | Config not opted in | Set `privacy.enabled = true` |
+| step 2 `✗ build_from_root_config returned None` | Provider not configured | Configure the matching `providers.<name>` block |
+| step 2 smoke test returns `''` | Model not pulled / wrong id | `ollama pull <model>` or fix model id |
+| step 3 empty + step 3b shows error response | Free-tier rate limit / wrong model | Switch model or add your own key |
+| step 3 empty + step 3b empty (silent) | LM timed out | Bump `privacy.semantic_timeout_seconds` |
+| step 7 returns `[]` | `embedding_model` unset / can't embed | Set `embedding_model` to an embedding-capable id |
 
-Same script also doubles as a feature smoke test: run with a known
-trigger like `sk-xsadsafsgdrghr` and confirm the path walks all the way
-to `blocked` at step 5.
-
-### 4.1 Try it from the CLI in one minute
-
-Enable GateKeeper in your config (or use `NANOBOT_PRIVACY__ENABLED=true`):
-
-```json
-{ "privacy": { "enabled": true } }
-```
-
-Then send a message that contains an obvious credential:
+### 4.1 Visualise the algorithm pieces (zero-dep)
 
 ```bash
-nanobot agent -m "Hello, my api key is sk-xsadsafsgdrghr" \
-              --config ~/.nanobot/config.json
+# Multivariate Laplace sampler: histogram + 2-D scatter + isotropy check
+python scripts/visualize_metric_dp.py
+
+# Token-replacement distribution across ε values
+python scripts/visualize_token_replacement.py
 ```
 
-What you should see:
+The token-replacement script run with `{0.2, 1, 5, 50}` shows the full
+trade-off in 200-trial batches:
 
-1. The CLI prints a **🛡 Privacy GateKeeper** banner listing the detected
-   entity (`credential / catastrophic`), the recommended path (`blocked`),
-   and your options.
-2. The default mode is `risk_threshold` — because the entity is
-   `catastrophic`, the gate asks you to confirm. Press Enter to accept the
-   recommendation (block), or `[c]` to cancel.
-3. The cloud LLM is **never called** when the path is `blocked`. You get a
-   refusal message instead.
-4. An entry appears in `~/.nanobot/privacy_audit/audit-YYYYMMDD.jsonl`.
+```
+ε = 0.2   →  near-uniform across 7/8 candidates    (strong privacy)
+ε = 1     →  top candidate 22 %                     (intermediate)
+ε = 5     →  top candidate 48 %                     (weak privacy)
+ε = 50    →  top candidate 100 % (always nearest)   (no privacy)
+```
 
-If you want fully automated runs without interactive prompts, set
-`privacy.confirmation.mode = "never"` — the gate then applies its
-recommendation silently.
-
-### 4.1 Run the privacy unit tests
+### 4.2 Run the unit and integration suites
 
 ```bash
-pytest tests/privacy/ -v
+pytest tests/privacy/ -v                      # ~190 cases, < 6 s
+pytest tests/agent/ tests/config/ tests/channels/ tests/providers/ -q
+ruff check nanobot/privacy/ tests/privacy/
 ```
 
-Expected: 43 tests pass.
+Expected: all green.
 
-### 4.2 Regression-check the rest of the suite
-
-```bash
-pytest tests/agent/ tests/config/ -q
-```
-
-Expected: 796 + 30 tests pass (the loop.py integration adds a state but does
-not change any existing handler behavior).
-
-### 4.3 Lint
-
-```bash
-ruff check nanobot/privacy/ tests/privacy/ nanobot/agent/loop.py nanobot/channels/base.py nanobot/config/schema.py
-```
-
-Expected: `All checks passed!`.
-
-### 4.4 End-to-end smoke (no LLM call needed)
+### 4.3 End-to-end smoke without a real LLM
 
 ```python
-import asyncio
+import asyncio, random
 from nanobot.config.schema import PrivacyConfig
-from nanobot.privacy import GateKeeper
+from nanobot.privacy.gate import GateKeeper
 from nanobot.privacy.types import ChannelCapabilities
+
+class FakeBackend:
+    name = "fake"
+    def is_available(self): return True
+    async def generate(self, p, **_): return ""
+    async def embed(self, t, **_):
+        # alice and a candidate sit at neighbouring vectors;
+        # everything else is on a different axis
+        return {"alice@x.com": [1,0,0,0,0,0,0,0],
+                "alex.morgan@example.com": [0.95,0.05,0,0,0,0,0,0]}.get(t, [1]+[0]*7)
 
 async def main():
     cfg = PrivacyConfig(enabled=True)
-    # Don't ask interactively for the smoke test
     cfg.confirmation.mode = "never"
-    gate = GateKeeper.from_config(cfg)
+    cfg.metric_dp.eps_query = 50.0   # high ε → nearest neighbour wins
+    cfg.metric_dp.eps_session_max = 1000
+    gate = GateKeeper.from_config(cfg, local_model=FakeBackend())
 
-    for text in [
-        "Hello, how are you?",                                  # NORMAL
-        "Email me at alice@example.com",                         # BLOCKED (medium, no path in M1)
-        "Use this AWS key: AKIAIOSFODNN7EXAMPLE for upload",     # BLOCKED (catastrophic)
-        "My CN ID is 110101199003079577 for the form",           # BLOCKED (high, no DP in M1)
-    ]:
-        rec = await gate.detect_and_recommend(text)
-        decision = await gate.confirm(rec, chat_id="c", channel_name="x",
-                                       capabilities=ChannelCapabilities())
-        out = gate.transform(decision, text)
-        print(f"{text[:50]:50}  →  {decision.path.value:10}  (reason: {rec.reason})")
+    raw = "Please email alice@x.com tomorrow."
+    rec = await gate.detect_and_recommend(raw, session_key="s", user_id="u")
+    print(f"path: {rec.path.value}")
+    d = await gate.confirm(rec, chat_id="c", channel_name="cli",
+                           capabilities=ChannelCapabilities())
+    out = await gate.transform(d, raw, session_key="s", user_id="u")
+    print(f"anonymised: {out.privacy_message}")
+    cloud = f"Got it — drafting an email to {list(out.restoration_plan['mapping'])[0]} now."
+    final = await gate.restore(cloud, out)
+    print(f"restored:   {final}")
 
 asyncio.run(main())
 ```
 
-Expected output:
+Output:
 ```
-Hello, how are you?                                →  normal      (reason: no_privacy_entity_detected)
-Email me at alice@example.com                      →  blocked     (reason: no_anonymization_path_available_yet)
-Use this AWS key: AKIAIOSFODNN7EXAMPLE for upload  →  blocked     (reason: hard_secret:credential)
-My CN ID is 110101199003079577 for the form        →  blocked     (reason: no_anonymization_path_available_yet)
+path: metric_dp
+anonymised: Please email alex.morgan@example.com tomorrow.
+restored:   Got it — drafting an email to alice@x.com now.
 ```
 
-### 4.5 Full agent loop test
-
-Enable GateKeeper in your config, start nanobot, and send a message containing
-sensitive content through any channel (CLI, Telegram, WebSocket, …). You
-should see the refusal message returned and an entry appear in
-`~/.nanobot/privacy_audit/audit-*.jsonl`.
+### 4.4 Live end-to-end with a real backend
 
 ```bash
-# Enable GateKeeper
-cat > /tmp/privacy_demo.json <<'EOF'
-{"privacy": {"enabled": true, "confirmation": {"mode": "never"}}}
-EOF
+# Enable privacy + configure an embedding-capable model in config.json,
+# then send a message that contains a MEDIUM entity:
+nanobot agent --logs --config ~/.nanobot/config.json \
+    -m "Please email alice@x.com about the demo tomorrow."
 
-# Merge it into your config (or set NANOBOT_PRIVACY__ENABLED=true)
-nanobot --config /tmp/privacy_demo.json chat "test my key sk-ant-test123 please"
-
-# Check the audit log
+# Check what the audit log captured:
 tail -1 ~/.nanobot/privacy_audit/audit-*.jsonl | python -m json.tool
+
+# Inspect the ε budget file:
+python -m json.tool ~/.nanobot/privacy_audit/budget.json
 ```
 
-### 4.6 WebSocket wire protocol (for custom clients / WebUI authors)
+### 4.5 WebSocket wire protocol (for custom clients / WebUI authors)
 
-When `privacy.enabled = true` and a WebSocket client is subscribed to a
-chat, the GateKeeper asks for confirmation by broadcasting an outbound
-envelope on the existing connection. The client replies with an inbound
-envelope; AgentLoop's turn is suspended until either the reply arrives or
-the configured timeout expires (default 120 s for WebSocket, fail-closed
-to BLOCKED on timeout).
-
-**Server → client** (outbound event, alongside `message` / `delta` etc.):
+Server → client (alongside `message`, `delta`, etc.):
 
 ```jsonc
 {
   "event": "privacy_confirmation",
   "chat_id": "<chat>",
   "confirmation_id": "<32-char hex>",
-  "path": "blocked",                       // system-recommended path
-  "reason": "hard_secret:credential",       // machine-friendly explanation
-  "allowed": ["blocked"],                   // user may only choose from this set
+  "path": "metric_dp",
+  "reason": "recommended_metric_dp",
+  "allowed": ["metric_dp", "blocked"],
   "entities": [
-    {
-      "type": "credential",
-      "risk_class": "catastrophic",
-      "linkability": "single_use",
-      "value": "sk-xsadsafsgdrghr",         // user's own data — show in the UI
-      "span": [21, 38],
-      "confidence": 1.0,
-      "detector": "regex:sk_prefixed"
-    }
+    {"type": "email", "risk_class": "medium",
+     "value": "alice@x.com", "span": [13, 24]}
   ]
 }
 ```
 
-**Client → server** (inbound envelope, sharing the same channel):
+Client → server:
 
 ```jsonc
 {
   "type": "privacy_confirmation_reply",
-  "confirmation_id": "<32-char hex>",       // must echo the prompt's id
-  "chosen_path": "blocked"                   // or null to cancel the message
+  "confirmation_id": "<echo the prompt's id>",
+  "chosen_path": "metric_dp"   // or null to cancel the message
 }
 ```
 
-Rules clients should rely on:
-
-- Any value in `chosen_path` that is **not** in the prompt's `allowed`
-  list is silently overridden to the system recommendation
-  (`violation_attempt` is recorded in the audit log). This is
-  intentional — the server does not reveal *why* a choice was rejected
-  to avoid leaking floor-rule structure to attackers.
-- `chosen_path: null` means "cancel this turn" (the message is treated
-  as BLOCKED with a cancellation refusal).
-- Replies with an **unknown** `confirmation_id` are silently ignored
-  (same reasoning). Malformed envelopes (missing `confirmation_id`,
-  unrecognized `chosen_path` string) generate an `error` event back.
-- The server cancels every pending confirmation when the channel stops,
-  so clients should treat connection loss as an implicit cancel.
+Rules:
+- `chosen_path` not in `allowed` → silently overridden to the
+  recommendation. The server doesn't reveal *why* a choice was rejected
+  to avoid leaking floor-rule structure.
+- Unknown `confirmation_id` → silently ignored.
+- Default timeout is 120 s; on timeout the gate falls back to BLOCKED.
+- The server cancels pending confirmations when the channel stops, so
+  clients should treat disconnect as implicit cancel.
 
 ---
 
 ## 5. Limits & roadmap
 
-### 5.1 What M1 cannot do (yet)
+### 5.1 What's solid right now
 
-- **Anonymize and forward.** Any MEDIUM/HIGH entity blocks the message in M1.
-  This is intentional fail-closed behavior pending the K-decoy (M2) and
-  Metric-DP (M3) transformers.
-- **Built-in semantic (small-model) detection.** Auto-wired when
-  `privacy.local_model` resolves to a usable backend — the GateKeeper
-  builds an `LLMSemanticDetector` against it and runs it as the
-  detector's second pass. The LM is asked for strict JSON and any
-  reported value not actually present in the message is dropped
-  (hallucination guard). Timeout, backend failure, or unparseable
-  output → semantic layer returns nothing and the regex hits stand on
-  their own (fail-closed at the layer boundary).
+- **NORMAL** (no entities or LOW only) — passthrough.
+- **BLOCKED** (CATASTROPHIC, hard-blocked types, budget exhausted) — informational refusal; cloud never called.
+- **METRIC_DP** (MEDIUM/HIGH with backend configured) — provable (ε)-dχ-privacy on the anonymised tokens; restored on the way back.
+- **CLI + WebSocket** interactive confirmation.
+- **Audit log** with metadata-only JSONL (no raw entities).
+- **ε budget management** across `(ε_session, ε_user_24h)` with on-disk persistence and user-id hashing.
 
-  To plug a fully custom detector instead, implement the
-  `SemanticDetector` protocol and pass it explicitly:
+### 5.2 What's intentionally NOT implemented yet
 
-    ```python
-    from nanobot.privacy import GateKeeper
-    from nanobot.privacy.detector import SemanticDetector
+- **K-decoy (M2)** — Generate k-1 "self-consistent" decoys and send all k to the cloud. We documented why this gives only *computational* plausible deniability (vs Metric-DP's formal guarantee), so it's a lower-priority "fast path" rather than a strict requirement. The decider has a `k_decoy_supported` flag that's hard-wired to False; turning it on is a small follow-up PR once we want it.
+- **LM-assisted Restorer rewriting** — The Restorer currently does deterministic substitution. If the cloud paraphrases the assigned pseudonym (e.g. "Bob" → "Robert"), the swap misses. Hook is reserved (`backend=`, `use_llm_rewrite=`) but not invoked.
+- **Tool-output filtering (M4)** — GateKeeper only inspects the user's inbound message. Filesystem reads, MCP outputs, web fetches, etc. flow to the cloud unfiltered.
+- **Envelope-encrypted audit (M4)** — Current logs are plaintext metadata-only JSONL. A KMS / age recipient wrap is reserved (`audit.kms_recipient` config field is already there but not honoured at write time).
+- **WebUI rendering** of the `privacy_confirmation` envelope — protocol is wired and tested; the React side renders nothing yet. Adding the popup is a frontend-only PR.
+- **Routing side-channel mitigation** (`routing_mode: balanced` / cover-traffic randomisation) — config field exists; the conservative-only path is the only one wired.
 
-    class MyCustomDetector:
-        async def detect(self, raw_message, regex_hits):
-            # call your own classifier here
-            return []
+### 5.3 Milestones
 
-    gate = GateKeeper.from_config(config.privacy, semantic_detector=MyCustomDetector())
-    ```
-- **Interactive confirmation in non-CLI channels.** CLI and **WebSocket**
-  are wired (see §4.0 for CLI; §4.6 below for the WebSocket wire
-  protocol). Telegram, Discord, Slack all fall back to
-  `forced_conservative` until each implements
-  `BaseChannel.privacy_capabilities()` with real `send_confirmation` /
-  `await_confirmation_reply` callbacks. The WebUI frontend rendering on
-  top of the WebSocket protocol is a follow-up PR.
-- **Tool-output filtering.** GateKeeper only inspects the user's inbound
-  message. Filesystem reads, MCP tool outputs, etc. are not scanned. M4 adds
-  catastrophic-entity scanning on outbound tool results.
-- **Envelope-encrypted audit.** M1 audit logs are plaintext JSONL (metadata
-  only — no raw entities). M4 wraps the file with a KMS / age recipient.
-
-### 5.2 Upcoming milestones
-
-| Milestone | Adds |
-|---|---|
-| **M2** | Pseudonym layer (session-keyed HMAC), `K_DECOY` transformer + restorer, `PrivacyAccountant` skeleton, first interactive-channel implementation (WebSocket). |
-| **M3** | `METRIC_DP` (dχ-privacy) on token embeddings, restorer with local LM, UI fidelity labels, ε budget enforcement. |
-| **M4** | Routing-side-channel mitigation, envelope-encrypted audit, tool-output catastrophic scanning, MyTool guard. |
+| ID | Status | Adds |
+|---|---|---|
+| M1 | ✅ | Detector + decider + confirmation + audit; BLOCKED + NORMAL paths. |
+| M1.5 | ✅ | SIMPLE stub closed; `LocalModelBackend` abstraction; CLI + WebSocket interactive confirmation; `local_model` via providers registry; `LLMSemanticDetector` auto-wired. |
+| M3 | ✅ | Multivariate Laplace; MetricDPTransform; PrivacyAccountant; Restorer; full GateKeeper / AgentLoop integration. |
+| M2 | not started | K-decoy + pseudonym layer. Optional "fast path"; weaker guarantees than M3 — most users will prefer Metric-DP. |
+| M4 | not started | Tool-output PII scanning; envelope-encrypted audit; routing-side-channel mitigation; MyTool guard. |
+| WebUI | not started | Render the `privacy_confirmation` envelope as a popup in the React UI. |
 
 ---
 
@@ -431,25 +415,62 @@ Rules clients should rely on:
 ```
 nanobot/privacy/
   __init__.py
-  types.py              # 200 lines  — enums + dataclasses
-  detector.py           # 280 lines  — regex + Luhn + CN-ID checksum + entropy + merge
-  decider.py            # 110 lines  — recommendation tree + allowed-set
-  confirmation.py       # 200 lines  — mode + preselect + timeout + fallback
-  audit.py              # 100 lines  — JSONL append-only
-  gate.py               # 140 lines  — facade
+  types.py               # enums + dataclasses
+  detector.py            # regex + plug-in semantic hook
+  semantic_detector.py   # LM-backed second pass + auto-wire helper
+  decider.py             # recommendation tree + allowed-set
+  confirmation.py        # mode + preselect + timeout + fallback
+  audit.py               # JSONL append-only
+  local_model.py         # LocalModelBackend protocol + LLMProviderBackend
+  metric_dp.py           # Laplace sampler (Andrés 2013 / Feyisetan 2020)
+  transform.py           # MetricDPTransform: embed + noise + nearest neighbour
+  accountant.py          # ε budget (ε_session, ε_user_24h)
+  restorer.py            # de-anonymize cloud responses
+  gate.py                # façade, wired by from_config
+  cli_channel_caps.py    # CLI interactive confirmation
 
-nanobot/config/schema.py   # +60 lines (PrivacyConfig + 4 sub-configs)
-nanobot/channels/base.py   # +30 lines (capability flags + hook)
-nanobot/agent/loop.py      # +130 lines (TurnState.GATE + handler + wiring)
+nanobot/agent/loop.py        # TurnState.GATE + _state_gate + _state_run restore
+nanobot/channels/base.py     # privacy_capabilities() hook
+nanobot/channels/websocket.py # privacy_confirmation / _reply envelopes + Future bridge
+nanobot/providers/base.py    # LLMProvider.embed() default
+nanobot/providers/openai_compat_provider.py  # /v1/embeddings + httpx fallback
+nanobot/providers/factory.py # make_provider(model_override=…)
+nanobot/config/schema.py     # PrivacyConfig + sub-configs
+nanobot/cli/commands.py      # CLI capability registration
 
 tests/privacy/
-  __init__.py
-  test_detector.py        # 15 cases
-  test_decider.py         # 9 cases
-  test_confirmation.py    # 11 cases
-  test_gate_and_audit.py  # 8 cases
+  test_detector.py
+  test_decider.py
+  test_confirmation.py
+  test_gate_and_audit.py
+  test_local_model.py
+  test_semantic_detector.py
+  test_metric_dp.py
+  test_transform.py
+  test_accountant.py
+  test_restorer.py
+  test_gate_integration.py
+tests/channels/test_websocket_privacy_confirmation.py
+tests/providers/test_embed.py
 
-.agent/privacy_gatekeeper.md   # design spec (v1.1)
+scripts/
+  debug_privacy.py             # pipeline diagnostic (config → … → embeddings)
+  visualize_metric_dp.py       # Laplace sampler histogram + scatter
+  visualize_token_replacement.py  # ε-vs-distribution trade-off
+
+.agent/privacy_gatekeeper.md   # design spec
+docs/privacy-gatekeeper-m1.md  # this file
 ```
 
-Total: ~1,030 lines of production code + ~530 lines of test code.
+Production code added across M1–M3: ~3,500 lines.
+Test code added: ~3,000 lines (190+ dedicated privacy cases).
+
+---
+
+## 7. References
+
+- Sweeney, L. (2002). *k-anonymity: A model for protecting privacy.* IJUFKS.
+- Andrés, M. E. et al. (2013). *Geo-indistinguishability: Differential privacy for location-based systems.* CCS.
+- Feyisetan, O. et al. (2020). *Privacy- and utility-preserving textual analysis via calibrated multivariate perturbations.* WSDM (MADLIB).
+- Yue, X. et al. (2021). *Differential privacy for text analytics via natural text sanitization.* ACL (SANTEXT).
+- Dwork, C. & Roth, A. (2014). *The Algorithmic Foundations of Differential Privacy.*
