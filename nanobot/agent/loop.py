@@ -1674,6 +1674,27 @@ class AgentLoop:
         if ctx.final_content is None or not ctx.final_content.strip():
             ctx.final_content = EMPTY_FINAL_RESPONSE_MESSAGE
 
+        # Privacy GateKeeper: restore pseudonyms in the messages we're
+        # about to persist. After this, the session log reads as the
+        # *user's view* of the conversation (real values), not the
+        # cloud's anonymized view. Next turn's context build re-runs
+        # detection + transform from this restored baseline, so each
+        # turn is its own clean dχ-privacy round.
+        if ctx.privacy_outcome is not None:
+            from nanobot.agent.runner import _walk_restore
+
+            mapping = (
+                getattr(ctx.privacy_outcome, "restoration_plan", None) or {}
+            ).get("mapping") or None
+            if mapping:
+                try:
+                    ctx.all_messages = _walk_restore(ctx.all_messages, mapping)
+                except Exception:
+                    logger.exception(
+                        "Privacy session-history restore failed; saving anonymized "
+                        "history (next turn's context will reflect cloud's view)"
+                    )
+
         ctx.save_skip = 1 + len(ctx.history) + (1 if ctx.user_persisted_early else 0)
         skip_msgs = ctx.all_messages[ctx.save_skip:]
         ctx.generated_media = generated_image_paths_from_messages(skip_msgs)

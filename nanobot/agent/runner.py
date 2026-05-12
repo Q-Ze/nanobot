@@ -330,19 +330,33 @@ class AgentRunner:
                 context.tool_results = list(results)
                 context.tool_events = list(new_events)
                 completed_tool_results: list[dict[str, Any]] = []
+                # If we're under METRIC_DP, build the *inverse* mapping
+                # (real → pseudonym) once per batch so tool results that
+                # mention the restored value (e.g. cron's "added job 'Send
+                # email to alice@x.com'") get re-anonymized before the
+                # cloud LLM sees them in the next iteration. Without this
+                # the cloud would observe the user's real value via tool
+                # output — defeating dχ-privacy on the second cloud call.
+                _inv_privacy_mapping = (
+                    {v: k for k, v in spec.privacy_mapping.items() if k and v}
+                    if spec.privacy_mapping else None
+                )
                 for tool_call, result in zip(tool_calls, results):
                     if isinstance(fatal_error, AskUserInterrupt) and tool_call.name == "ask_user":
                         continue
+                    tool_content = self._normalize_tool_result(
+                        spec,
+                        tool_call.id,
+                        tool_call.name,
+                        result,
+                    )
+                    if _inv_privacy_mapping:
+                        tool_content = _walk_restore(tool_content, _inv_privacy_mapping)
                     tool_message = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": tool_call.name,
-                        "content": self._normalize_tool_result(
-                            spec,
-                            tool_call.id,
-                            tool_call.name,
-                            result,
-                        ),
+                        "content": tool_content,
                     }
                     messages.append(tool_message)
                     completed_tool_results.append(tool_message)
