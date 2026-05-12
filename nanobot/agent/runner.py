@@ -81,6 +81,13 @@ class AgentRunSpec:
     checkpoint_callback: Any | None = None
     injection_callback: Any | None = None
     llm_timeout_s: float | None = None
+    # Privacy GateKeeper Metric-DP restoration plan, when applicable.
+    # Maps anonymized values that the cloud LLM saw → the user's real
+    # values. The runner restores tool-call arguments through this map
+    # before invoking the local tool so that, e.g., a cron job persisted
+    # by the agent contains the *real* email address, not the pseudonym.
+    # See nanobot.agent.loop._state_run for where it's wired.
+    privacy_mapping: dict[str, str] | None = None
 
 
 @dataclass(slots=True)
@@ -763,9 +770,17 @@ class AgentRunner:
             return lookup_error + hint, event, None
         prepare_call = getattr(spec.tools, "prepare_call", None)
         tool, params, prep_error = None, tool_call.arguments, None
+        # Privacy GateKeeper: when the user's message went through METRIC_DP
+        # we replaced their real values with pseudonyms before showing the
+        # cloud. The cloud now hands us tool calls whose arguments reference
+        # those pseudonyms. Before any local tool executes (and especially
+        # before anything gets persisted to disk by cron / write_file /
+        # mcp), swap the pseudonyms back so tools act on the real values.
+        if spec.privacy_mapping:
+            params = _restore_tool_arguments(params, spec.privacy_mapping)
         if callable(prepare_call):
             with suppress(Exception):
-                prepared = prepare_call(tool_call.name, tool_call.arguments)
+                prepared = prepare_call(tool_call.name, params)
                 if isinstance(prepared, tuple) and len(prepared) == 3:
                     tool, params, prep_error = prepared
         if prep_error:
@@ -1200,3 +1215,70 @@ class AgentRunner:
         if current:
             batches.append(current)
         return batches
+
+
+def _restore_tool_arguments(arguments: Any, mapping: dict[str, str]) -> Any:
+    """Walk a tool-call argument tree and swap pseudonyms back to originals.
+
+    Tool arguments are usually a ``dict[str, Any]`` with string leaves —
+    the kind of structure a JSON-shaped tool schema produces. This walks
+    dicts, lists, and tuples recursively and runs every string value
+    through the same algorithm :class:`nanobot.privacy.restorer.Restorer`
+    uses (longest-key-first, sentinel-protected, ASCII vs non-ASCII
+    boundary handling).
+
+    The function is fail-soft: any exception falls back to the original
+    arguments rather than crashing the tool call. The privacy guarantee
+    is *upstream* of this — the pseudonym already went to the cloud;
+    what we save here is correctness of local tool side effects (cron
+    scheduling, file writes, MCP arguments, …).
+    """
+    if not mapping or arguments is None:
+        return arguments
+    try:
+        return _walk_restore(arguments, mapping)
+    except Exception:
+        return arguments
+
+
+def _walk_restore(node: Any, mapping: dict[str, str]) -> Any:
+    if isinstance(node, str):
+        return _sync_restore(node, mapping)
+    if isinstance(node, dict):
+        return {k: _walk_restore(v, mapping) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_walk_restore(v, mapping) for v in node]
+    if isinstance(node, tuple):
+        return tuple(_walk_restore(v, mapping) for v in node)
+    return node
+
+
+def _sync_restore(text: str, mapping: dict[str, str]) -> str:
+    """Synchronous twin of :meth:`Restorer.restore`.
+
+    Same algorithm: longest-key-first substitution with sentinels to
+    prevent A→B→C chain replacements, plus ``(?<!\\w)…(?!\\w)``
+    boundaries for ASCII keys. Lives here (rather than reusing the
+    async Restorer) because tool-arg restoration runs inside a hot
+    request loop where spinning up new event loops per string is
+    needlessly expensive — and the Restorer body is pure CPU work
+    that didn't need to be async in the first place.
+    """
+    import re
+
+    cleaned = {k: v for k, v in mapping.items()
+               if isinstance(k, str) and isinstance(v, str) and k}
+    if not cleaned or not text:
+        return text
+    keys = sorted(cleaned.keys(), key=len, reverse=True)
+    sentinels = {k: f"\x00SENT_{i}\x00" for i, k in enumerate(keys)}
+    for k in keys:
+        if k.isascii():
+            text = re.compile(r"(?<!\w)" + re.escape(k) + r"(?!\w)").sub(
+                sentinels[k], text
+            )
+        else:
+            text = text.replace(k, sentinels[k])
+    for k in keys:
+        text = text.replace(sentinels[k], cleaned[k])
+    return text

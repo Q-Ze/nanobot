@@ -218,7 +218,7 @@ def test_build_returns_none_when_provider_factory_raises(monkeypatch):
     assert build_from_root_config(root) is None
 
 
-def test_build_uses_separate_embedding_provider(monkeypatch):
+async def test_build_uses_separate_embedding_provider(monkeypatch):
     root = MagicMock()
     root.privacy.enabled = True
     root.privacy.local_model = "ollama/qwen2.5:0.5b"
@@ -242,13 +242,12 @@ def test_build_uses_separate_embedding_provider(monkeypatch):
     assert "ollama/qwen2.5:0.5b" in calls
     assert "ollama/nomic-embed-text" in calls
 
-    import asyncio
-    out = asyncio.get_event_loop().run_until_complete(backend.embed("hello"))
+    out = await backend.embed("hello")
     assert out == [0.1, 0.2]
     embed.embed.assert_awaited_once_with("hello", model="ollama/nomic-embed-text")
 
 
-def test_build_falls_back_to_no_embeddings_when_embedding_provider_fails(monkeypatch):
+async def test_build_falls_back_to_no_embeddings_when_embedding_provider_fails(monkeypatch):
     root = MagicMock()
     root.privacy.enabled = True
     root.privacy.local_model = "ollama/qwen2.5:0.5b"
@@ -266,6 +265,5 @@ def test_build_falls_back_to_no_embeddings_when_embedding_provider_fails(monkeyp
     backend = build_from_root_config(root)
     assert backend is not None
     # Chat path still works; embed path silently returns [].
-    import asyncio
-    out = asyncio.get_event_loop().run_until_complete(backend.embed("hello"))
+    out = await backend.embed("hello")
     assert out == []

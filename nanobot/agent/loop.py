@@ -843,6 +843,7 @@ class AgentLoop:
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
         pending_queue: asyncio.Queue | None = None,
+        privacy_mapping: dict[str, str] | None = None,
     ) -> tuple[str | None, list[str], list[dict], str, bool]:
         """Run the agent iteration loop.
 
@@ -957,6 +958,7 @@ class AgentLoop:
                 retry_wait_callback=on_retry_wait,
                 checkpoint_callback=_checkpoint,
                 injection_callback=_drain_pending,
+                privacy_mapping=privacy_mapping,
             ))
         finally:
             reset_file_states(file_state_token)
@@ -1622,6 +1624,15 @@ class AgentLoop:
         return "ok"
 
     async def _state_run(self, ctx: TurnContext) -> str:
+        # If the gate transformed the inbound, the same anonymization
+        # mapping must apply to any tool calls the cloud emits so cron /
+        # write_file / mcp / etc don't persist pseudonyms.
+        privacy_mapping = None
+        if ctx.privacy_outcome is not None:
+            privacy_mapping = (
+                getattr(ctx.privacy_outcome, "restoration_plan", None) or {}
+            ).get("mapping") or None
+
         result = await self._run_agent_loop(
             ctx.initial_messages,
             on_progress=ctx.on_progress,
@@ -1635,6 +1646,7 @@ class AgentLoop:
             metadata=ctx.msg.metadata,
             session_key=ctx.session_key,
             pending_queue=ctx.pending_queue,
+            privacy_mapping=privacy_mapping,
         )
         final_content, tools_used, all_msgs, stop_reason, had_injections = result
         ctx.final_content = final_content
