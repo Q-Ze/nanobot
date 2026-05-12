@@ -81,3 +81,78 @@ async def test_base_provider_embed_default_returns_empty():
 
     provider = AnthropicProvider(api_key="x", default_model="claude-3")
     assert await provider.embed("hello") == []
+
+
+# --- OpenRouter / gateway whitespace-prefix fallback ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_embed_falls_back_to_httpx_when_sdk_rejects_whitespace_prefix(
+    monkeypatch,
+):
+    """OpenRouter free-tier prepends `\\n         \\n` to the JSON body.
+
+    The OpenAI SDK raises ``ValueError: No embedding data received`` and we
+    must fall back to a direct HTTP call that ``lstrip``s the body before
+    parsing. Verified by simulating both the SDK rejection and a synthetic
+    OpenRouter-style response.
+    """
+    import httpx
+
+    provider = _provider_with_fake_client(
+        AsyncMock(side_effect=ValueError("No embedding data received"))
+    )
+    # Make sure the fallback target is reachable looking
+    provider._effective_base = "https://openrouter.ai/api/v1"
+    provider.api_key = "sk-or-fake"
+
+    # Synthetic body shaped like the broken OpenRouter response.
+    body = (
+        b'\n         \n'
+        b'{"object":"list","data":[{"object":"embedding",'
+        b'"embedding":[0.1, 0.2, 0.3]}]}'
+    )
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            req = httpx.Request("POST", url)
+            return httpx.Response(200, content=body, request=req)
+
+    monkeypatch.setattr("httpx.AsyncClient", _FakeAsyncClient)
+
+    out = await provider.embed("hello", model="x")
+    assert out == [0.1, 0.2, 0.3]
+
+
+@pytest.mark.asyncio
+async def test_embed_fallback_returns_empty_on_http_error(monkeypatch):
+    import httpx
+
+    provider = _provider_with_fake_client(
+        AsyncMock(side_effect=ValueError("No embedding data received"))
+    )
+    provider._effective_base = "https://example.com"
+    provider.api_key = "k"
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            req = httpx.Request("POST", url)
+            return httpx.Response(429, content=b'{"error":"rate"}', request=req)
+
+    monkeypatch.setattr("httpx.AsyncClient", _FakeAsyncClient)
+    assert await provider.embed("hello") == []
+
+
+@pytest.mark.asyncio
+async def test_embed_unrelated_value_error_still_returns_empty():
+    """ValueError that *isn't* the whitespace-prefix one is not retried."""
+    provider = _provider_with_fake_client(
+        AsyncMock(side_effect=ValueError("invalid input format"))
+    )
+    assert await provider.embed("hello") == []

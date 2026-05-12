@@ -1127,6 +1127,13 @@ class OpenAICompatProvider(LLMProvider):
 
         The caller is responsible for passing an *embedding* model id —
         most local servers reject a chat model with HTTP 400.
+
+        Resilience note: some gateways (observed on OpenRouter free-tier
+        models) prepend keep-alive whitespace to the JSON body. The OpenAI
+        SDK's strict parser then raises ``ValueError: No embedding data
+        received`` even though the wire response was perfectly fine. We
+        detect that specific failure and fall back to a direct httpx call
+        that ``lstrip``s the body before parsing.
         """
         if not text:
             return []
@@ -1135,6 +1142,15 @@ class OpenAICompatProvider(LLMProvider):
             response = await self._client.embeddings.create(
                 input=text, model=target_model
             )
+        except ValueError as exc:
+            if "No embedding data" in str(exc):
+                return await self._embed_via_httpx_fallback(text, target_model)
+            from loguru import logger as _logger
+            _logger.debug(
+                "embed() failed via {}: {!r}",
+                getattr(self, "_effective_base", "?"), exc,
+            )
+            return []
         except Exception as exc:  # noqa: BLE001
             from loguru import logger as _logger
             _logger.debug(
@@ -1150,6 +1166,53 @@ class OpenAICompatProvider(LLMProvider):
             return list(vector) if vector is not None else []
         except (AttributeError, IndexError, TypeError):
             return []
+
+    async def _embed_via_httpx_fallback(
+        self, text: str, model: str
+    ) -> list[float]:
+        """Direct embedding call for gateways that return non-canonical JSON.
+
+        Only invoked when the OpenAI SDK has already rejected the response.
+        Strips leading whitespace from the body before parsing, which fixes
+        OpenRouter's free-tier "\\n         \\n{...}" keep-alive prefix.
+        """
+        import json
+
+        import httpx
+
+        base = (self._effective_base or "").rstrip("/")
+        if not base or not self.api_key:
+            return []
+        url = f"{base}/embeddings"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=_openai_compat_timeout_s()) as c:
+                r = await c.post(
+                    url,
+                    headers=headers,
+                    json={"input": text, "model": model},
+                )
+        except Exception as exc:  # noqa: BLE001
+            from loguru import logger as _logger
+            _logger.debug("embed() httpx fallback failed via {}: {!r}", url, exc)
+            return []
+        if r.status_code != 200:
+            return []
+        # The whole point of this fallback: tolerate leading whitespace /
+        # keep-alive bytes that confuse the SDK's incremental parser.
+        body = r.content.lstrip()
+        try:
+            payload = json.loads(body)
+        except Exception:  # noqa: BLE001
+            return []
+        data = payload.get("data") or []
+        if not data:
+            return []
+        vector = data[0].get("embedding")
+        return list(vector) if isinstance(vector, list) else []
 
     async def chat(
         self,
