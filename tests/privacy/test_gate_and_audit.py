@@ -77,7 +77,7 @@ async def test_gatekeeper_facade_blocks_credential(tmp_path: Path):
         capabilities=ChannelCapabilities(),
     )
     assert decision.path == ExecutionPath.BLOCKED
-    outcome = gate.transform(decision, "...")
+    outcome = await gate.transform(decision, "...")
     assert isinstance(outcome.privacy_message, str)
     assert outcome.audit_view is not None
     gate.record_audit(session_key="alice", decision=decision, view=outcome.audit_view)
@@ -94,7 +94,7 @@ async def test_gatekeeper_facade_passes_low_risk(tmp_path: Path):
     assert rec.path == ExecutionPath.NORMAL
     decision = await gate.confirm(rec, chat_id="c", channel_name="x", capabilities=ChannelCapabilities())
     assert decision.path == ExecutionPath.NORMAL
-    outcome = gate.transform(decision, "Hello, how are you today?")
+    outcome = await gate.transform(decision, "Hello, how are you today?")
     assert outcome.privacy_message == "Hello, how are you today?"
 
 
@@ -115,7 +115,7 @@ async def test_restore_is_identity_for_m1_paths(tmp_path: Path):
     gate = GateKeeper.from_config(cfg)
     rec = await gate.detect_and_recommend("Hello world")
     decision = await gate.confirm(rec, chat_id="c", channel_name="x", capabilities=ChannelCapabilities())
-    outcome = gate.transform(decision, "Hello world")
+    outcome = await gate.transform(decision, "Hello world")
     restored = await gate.restore("LLM reply", outcome)
     assert restored == "LLM reply"
 
@@ -131,7 +131,7 @@ async def test_simple_path_is_not_exposed_in_m1_5(tmp_path: Path):
     assert ExecutionPath.SIMPLE not in rec.allowed
 
 
-def test_transform_refuses_unimplemented_paths(tmp_path: Path):
+async def test_transform_refuses_unimplemented_paths(tmp_path: Path):
     """Defensive: if a non-NORMAL/BLOCKED path somehow reaches transform, refuse."""
     cfg = PrivacyConfig(enabled=True)
     cfg.audit.log_dir = str(tmp_path)
@@ -143,5 +143,5 @@ def test_transform_refuses_unimplemented_paths(tmp_path: Path):
         entities=(_entity(),),
     )
     decision = Decision(path=ExecutionPath.K_DECOY, source=PathSource.SYSTEM_AUTO, recommendation=rec)
-    outcome = gate.transform(decision, "raw text")
+    outcome = await gate.transform(decision, "raw text")
     assert "not implemented" in outcome.privacy_message.lower()

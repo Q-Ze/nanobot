@@ -236,6 +236,12 @@ class TurnContext:
     pending_queue: asyncio.Queue | None = None
     pending_summary: str | None = None
 
+    # Privacy GateKeeper outcome from _state_gate, consulted at the end of
+    # _state_run so the Restorer can de-anonymize the cloud response before
+    # _state_save/_state_respond consume ctx.final_content. None means the
+    # gate was disabled or the path required no transform (e.g. NORMAL).
+    privacy_outcome: Any = None
+
     trace: list[StateTraceEntry] = field(default_factory=list)
 
 
@@ -1464,14 +1470,18 @@ class AgentLoop:
 
         Pass-through if disabled. Otherwise may block the message (sets
         ctx.outbound to a refusal and returns "blocked"), rewrite content
-        (replace ctx.msg.content with sanitized text), or attach audit
+        (replace ctx.msg.content with anonymised text), or attach audit
         metadata for downstream stages.
         """
         gate = getattr(self, "_gatekeeper", None)
         if gate is None:
             return "ok"
         try:
-            recommendation = await gate.detect_and_recommend(ctx.msg.content)
+            recommendation = await gate.detect_and_recommend(
+                ctx.msg.content,
+                session_key=ctx.session_key,
+                user_id=ctx.msg.sender_id,
+            )
             user_pref = self._extract_user_path_preference(ctx.msg)
             decision = await gate.confirm(
                 recommendation,
@@ -1480,7 +1490,12 @@ class AgentLoop:
                 capabilities=self._channel_capabilities(ctx.msg.channel),
                 user_path_preference=user_pref,
             )
-            outcome = gate.transform(decision, ctx.msg.content)
+            outcome = await gate.transform(
+                decision,
+                ctx.msg.content,
+                session_key=ctx.session_key,
+                user_id=ctx.msg.sender_id,
+            )
             gate.record_audit(
                 session_key=ctx.session_key,
                 decision=decision,
@@ -1505,16 +1520,17 @@ class AgentLoop:
                 "recommended_path": outcome.audit_view.recommended_path.value,
                 "source": outcome.audit_view.source.value,
                 "fidelity": outcome.audit_view.fidelity,
+                "eps_consumed": outcome.audit_view.eps_consumed,
             }
         ctx.msg = dataclasses.replace(ctx.msg, metadata=meta)
 
         from nanobot.privacy.types import ExecutionPath as _Path
 
-        # Only NORMAL is allowed to reach the cloud LLM in M1.5. BLOCKED short-circuits
-        # to DONE; SIMPLE / K_DECOY / METRIC_DP are accepted by the type system but the
-        # transformers are not implemented yet — they must NOT silently leak plaintext
-        # to the cloud, so we treat them as blocked at the integration layer too.
-        if decision.path == _Path.BLOCKED or decision.path != _Path.NORMAL:
+        # NORMAL and METRIC_DP both forward to the cloud (METRIC_DP after
+        # anonymisation). Everything else (BLOCKED, SIMPLE/K_DECOY when not
+        # wired) short-circuits to DONE with a refusal.
+        allowed_to_forward = {_Path.NORMAL, _Path.METRIC_DP}
+        if decision.path not in allowed_to_forward:
             refusal = outcome.privacy_message if isinstance(outcome.privacy_message, str) else (
                 outcome.privacy_message[0] if outcome.privacy_message else ""
             )
@@ -1527,10 +1543,11 @@ class AgentLoop:
             )
             return "blocked"
 
-        # NORMAL: forward to the cloud as-is. M2/M3 transformers may rewrite the
-        # content (e.g. pseudonym substitution); honour any rewrite here.
+        # METRIC_DP: hand the anonymised text to the cloud; remember the
+        # restoration plan so _state_run can de-anonymize the response.
         if isinstance(outcome.privacy_message, str) and outcome.privacy_message != ctx.msg.content:
             ctx.msg = dataclasses.replace(ctx.msg, content=outcome.privacy_message)
+        ctx.privacy_outcome = outcome
         return "ok"
 
     @staticmethod
@@ -1625,6 +1642,20 @@ class AgentLoop:
         ctx.all_messages = all_msgs
         ctx.stop_reason = stop_reason
         ctx.had_injections = had_injections
+
+        # Privacy GateKeeper restore: if the message went through METRIC_DP,
+        # the cloud reply still contains pseudonyms — swap them back to the
+        # user's real values before _state_save / _state_respond pick up
+        # ctx.final_content. No-op when the gate is off or the chosen path
+        # didn't anonymize anything.
+        gate = getattr(self, "_gatekeeper", None)
+        if gate is not None and ctx.privacy_outcome is not None and ctx.final_content:
+            try:
+                ctx.final_content = await gate.restore(
+                    ctx.final_content, ctx.privacy_outcome
+                )
+            except Exception:
+                logger.exception("Privacy GateKeeper restore failed; leaving response as-is")
         return "ok"
 
     async def _state_save(self, ctx: TurnContext) -> str:
