@@ -140,6 +140,56 @@ async def main() -> int:
     else:
         print(f"  privacy_message  = {msg[:120]!r}{'…' if len(msg) > 120 else ''}")
 
+    _line("7. embeddings (M3 step 1)")
+    if backend is None or not backend.is_available():
+        print("  (skipped — no backend wired)")
+    else:
+        emb_model = getattr(cfg.privacy, "embedding_model", None)
+        print(f"  configured embedding_model = {emb_model!r}")
+        if not emb_model:
+            print("  ⚠ embedding_model is unset. backend.embed() will reuse the chat model;")
+            print("    most servers will return HTTP 400 and the backend falls back to [].")
+            print("    For Ollama set e.g. privacy.embedding_model = 'ollama/nomic-embed-text'")
+            print("    and pull it first: `ollama pull nomic-embed-text`.")
+
+        async def _try_embed(label: str, text: str) -> list[float]:
+            try:
+                vec = await backend.embed(text)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  ✗ embed({label!r}) raised: {exc!r}")
+                return []
+            if not vec:
+                print(f"  ✗ embed({label!r}) → empty vector "
+                      "(provider rejected the call, model not pulled, "
+                      "or transport error)")
+                return []
+            preview = ", ".join(f"{v:+.4f}" for v in vec[:4])
+            print(f"  ✓ embed({label!r}) → dim={len(vec)}  [{preview}, …]")
+            return vec
+
+        v1 = await _try_embed("Hello, how are you?", "Hello, how are you?")
+        v2 = await _try_embed("Greetings, what's up?", "Greetings, what's up?")
+        v3 = await _try_embed("The capital of France is Paris.",
+                              "The capital of France is Paris.")
+
+        if v1 and v2 and v3 and len(v1) == len(v2) == len(v3):
+            def _cos(a: list[float], b: list[float]) -> float:
+                import math
+                dot = sum(x * y for x, y in zip(a, b))
+                na = math.sqrt(sum(x * x for x in a))
+                nb = math.sqrt(sum(y * y for y in b))
+                return dot / (na * nb) if na and nb else 0.0
+
+            sim_close = _cos(v1, v2)
+            sim_far = _cos(v1, v3)
+            print(f"  cos('hi', 'greet')   = {sim_close:+.4f}  (should be HIGH — near 1)")
+            print(f"  cos('hi', 'Paris')   = {sim_far:+.4f}  (should be LOW — closer to 0)")
+            if sim_close > sim_far:
+                print("  ✓ semantic ordering looks correct.")
+            else:
+                print("  ⚠ similar texts didn't score higher — the embedding model may be")
+                print("    a chat model masquerading; double-check the model id.")
+
     _line("done")
     return 0
 
