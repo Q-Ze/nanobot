@@ -1528,10 +1528,10 @@ class AgentLoop:
 
         from nanobot.privacy.types import ExecutionPath as _Path
 
-        # NORMAL and METRIC_DP both forward to the cloud (METRIC_DP after
-        # anonymisation). Everything else (BLOCKED, SIMPLE/K_DECOY when not
-        # wired) short-circuits to DONE with a refusal.
-        allowed_to_forward = {_Path.NORMAL, _Path.METRIC_DP}
+        # NORMAL, METRIC_DP and K_DECOY all forward to the cloud
+        # (METRIC_DP / K_DECOY after anonymisation). Everything else
+        # (BLOCKED, SIMPLE) short-circuits to DONE with a refusal.
+        allowed_to_forward = {_Path.NORMAL, _Path.METRIC_DP, _Path.K_DECOY}
         if decision.path not in allowed_to_forward:
             refusal = outcome.privacy_message if isinstance(outcome.privacy_message, str) else (
                 outcome.privacy_message[0] if outcome.privacy_message else ""
@@ -1551,16 +1551,17 @@ class AgentLoop:
             ctx.msg = dataclasses.replace(ctx.msg, content=outcome.privacy_message)
         ctx.privacy_outcome = outcome
 
-        # METRIC_DP responses must be restored AFTER the cloud finishes —
-        # streaming would expose the pseudonyms to the user terminal long
-        # before that restore happens. Suppress the on_stream callback
-        # for this turn so the only display path is _print_agent_response
-        # against the already-restored ctx.final_content. The trade-off
-        # is no incremental token rendering for METRIC_DP turns; we judge
-        # that worth it over leaking pseudonyms onto the screen.
+        # METRIC_DP / K_DECOY responses must be restored AFTER the cloud
+        # finishes — streaming would expose the pseudonyms to the user
+        # terminal long before that restore happens. Suppress the
+        # on_stream callback for these turns so the only display path is
+        # _print_agent_response against the already-restored
+        # ctx.final_content. The trade-off is no incremental token
+        # rendering for anonymized turns; we judge that worth it over
+        # leaking pseudonyms onto the screen.
         from nanobot.privacy.types import ExecutionPath as _Path2
 
-        if decision.path == _Path2.METRIC_DP:
+        if decision.path in (_Path2.METRIC_DP, _Path2.K_DECOY):
             ctx.on_stream = None
             ctx.on_stream_end = None
 
