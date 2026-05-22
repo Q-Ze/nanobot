@@ -7,6 +7,7 @@
 > guarantee on the anonymisation step.
 >
 > Design spec: [`.agent/privacy_gatekeeper.md`](../.agent/privacy_gatekeeper.md).
+> Changes since M3 (M2 K_DECOY + cloud-boundary fixes + UX): [`privacy-gatekeeper-changelog.md`](./privacy-gatekeeper-changelog.md).
 
 This document describes what's shipped, how to enable it, how to test
 it locally, and what's intentionally left for future milestones.
