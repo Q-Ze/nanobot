@@ -258,3 +258,52 @@ async def test_audit_view_records_eps_for_metric_dp(tmp_path: Path):
     # An audit JSONL line was written.
     files = list(tmp_path.glob("audit-*.jsonl"))
     assert files
+
+
+# --- A1: budget-exhausted reason override ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_blocked_reason_distinguishes_budget_exhaustion(tmp_path: Path):
+    """When METRIC_DP is unavailable *only* because the accountant is out of
+    budget (transform + backend still functional), the BLOCKED reason
+    must include 'eps_budget_exhausted' so the UX doesn't read like
+    'feature not implemented'.
+    """
+    cfg = _silent_cfg(tmp_path)
+    cfg.metric_dp.eps_query = 8.0
+    cfg.metric_dp.eps_session_max = 100.0
+    cfg.metric_dp.eps_user_24h_max = 8.0    # exactly one query worth
+    gate = GateKeeper.from_config(cfg, local_model=_Backend(_TABLE))
+
+    raw = "Email alice@x.com please"
+    # Burn the entire daily cap with one METRIC_DP query.
+    rec1 = await gate.detect_and_recommend(raw, session_key="sX", user_id="user-X")
+    assert rec1.path == ExecutionPath.METRIC_DP
+    d1 = await gate.confirm(rec1, chat_id="cX", channel_name="cli",
+                            capabilities=ChannelCapabilities())
+    await gate.transform(d1, raw, session_key="sX", user_id="user-X")
+
+    # Second turn: same content, but accountant denies. Reason should
+    # tell the user it's a budget thing, not a missing-feature thing.
+    rec2 = await gate.detect_and_recommend(raw, session_key="sX", user_id="user-X")
+    assert rec2.path == ExecutionPath.BLOCKED
+    assert "eps_budget_exhausted" in rec2.reason
+    assert "8.0/8.0" in rec2.reason            # used / cap
+    assert "next refresh in" in rec2.reason    # refresh ETA included
+
+
+@pytest.mark.asyncio
+async def test_blocked_reason_unchanged_when_no_backend(tmp_path: Path):
+    """When the *real* cause of BLOCKED is a missing backend (no transform,
+    so accountant never even gets consulted), the original
+    no_anonymization_path_available_yet reason must be preserved — the
+    A1 override must not falsely accuse the budget."""
+    cfg = _silent_cfg(tmp_path)
+    gate = GateKeeper.from_config(cfg)  # no local_model
+
+    raw = "Email alice@x.com please"
+    rec = await gate.detect_and_recommend(raw, session_key="sY", user_id="user-Y")
+    assert rec.path == ExecutionPath.BLOCKED
+    assert rec.reason == "no_anonymization_path_available_yet"
+    assert "eps_budget_exhausted" not in rec.reason

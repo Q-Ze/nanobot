@@ -145,6 +145,22 @@ class PrivacyAccountant:
         """Cheap pre-flight check; equivalent to ``snapshot(...).can_afford(eps)``."""
         return self.snapshot(session_key, user_id).can_afford(eps)
 
+    def time_until_next_refresh(self, user_id: str) -> float | None:
+        """Seconds until the oldest ε entry ages out of the 24h window.
+
+        Returns None if there are no live entries for the user. The value
+        is when *some* budget frees up (the oldest entry), not when the
+        cap is fully restored. Useful for UX messages like
+        "eps_budget_exhausted, next refresh in 21h".
+        """
+        h = _hash(user_id)
+        with self._lock:
+            entries = self._user_entries.get(h)
+            if not entries:
+                return None
+            oldest_ts = min(ts for ts, _ in entries)
+        return max(0.0, oldest_ts + _SECONDS_PER_DAY - self._clock())
+
     def consume(self, session_key: str, user_id: str, eps: float) -> BudgetSnapshot:
         """Record ε spent; raises :class:`BudgetExceeded` if not affordable.
 

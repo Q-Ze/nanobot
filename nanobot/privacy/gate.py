@@ -169,20 +169,37 @@ class GateKeeper:
         BLOCKED when MEDIUM/HIGH entities are present.
         """
         entities = await self._detector.detect(raw_message)
-        metric_dp_supported = bool(
-            self._transform is not None
-            and self._local_model.is_available()
-            and (
-                self._accountant is None
-                or self._accountant.can_afford(session_key, user_id, self._eps_query)
-            )
+        backend_ok = self._local_model.is_available()
+        transform_ok = self._transform is not None
+        budget_ok = (
+            self._accountant is None
+            or self._accountant.can_afford(session_key, user_id, self._eps_query)
         )
+        metric_dp_supported = bool(transform_ok and backend_ok and budget_ok)
         inputs = replace(
             self._static_caps,
             entities=tuple(entities),
             metric_dp_supported=metric_dp_supported,
         )
         recommendation = self._decider.decide(inputs)
+        # If decider blocked solely because METRIC_DP is out of budget
+        # (transform+backend exist, accountant refused), replace the
+        # generic "no path available" reason with a budget-specific one
+        # so the user sees *why* and roughly when it'll refresh.
+        if (
+            recommendation.path == ExecutionPath.BLOCKED
+            and recommendation.reason == "no_anonymization_path_available_yet"
+            and transform_ok
+            and backend_ok
+            and self._accountant is not None
+            and not budget_ok
+        ):
+            recommendation = replace(
+                recommendation,
+                reason=_format_budget_exhausted_reason(
+                    self._accountant, session_key, user_id
+                ),
+            )
         # Visible breadcrumb showing detector + decider outcome.
         # We log counts and types but never raw entity values.
         type_counts: dict[str, int] = {}
@@ -351,3 +368,37 @@ def _default_refusal(decision: Decision) -> str:
         "Privacy GateKeeper blocked this message. "
         f"Reason: {reason}. Please remove the sensitive content and try again."
     )
+
+
+def _format_budget_exhausted_reason(
+    accountant: PrivacyAccountant, session_key: str, user_id: str
+) -> str:
+    """Build a reason string explaining that the ε accountant is out of budget.
+
+    Mentions the 24-h cap (the one most users will hit during testing)
+    and the soonest moment any ε frees up. The session counter is
+    included only when it's the limiting factor — otherwise the
+    24-h line is the actionable one.
+    """
+    snap = accountant.snapshot(session_key, user_id)
+    refresh_str = _humanize_seconds(accountant.time_until_next_refresh(user_id))
+    parts = [
+        f"used {snap.eps_user_24h_used:.1f}/{snap.eps_user_24h_max:.1f} ε in 24h"
+    ]
+    if snap.remaining_session <= 0 < snap.remaining_user_24h:
+        parts.append(
+            f"session {snap.eps_session_used:.1f}/{snap.eps_session_max:.1f} ε"
+        )
+    if refresh_str:
+        parts.append(f"next refresh in {refresh_str}")
+    return "eps_budget_exhausted (" + ", ".join(parts) + ")"
+
+
+def _humanize_seconds(seconds: float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return ""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    return f"{seconds / 3600:.1f}h"

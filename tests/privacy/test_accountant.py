@@ -320,3 +320,40 @@ def test_persisted_json_is_well_formed(tmp_path: Path):
     assert all(len(e) == 2 for e in entries)
     assert all(isinstance(e[0], (int, float)) and isinstance(e[1], (int, float))
                for e in entries)
+
+
+# --- time_until_next_refresh -----------------------------------------------------------
+
+
+def test_time_until_next_refresh_returns_none_when_empty():
+    acc = PrivacyAccountant(eps_session_max=8.0, eps_user_24h_max=8.0)
+    assert acc.time_until_next_refresh("alice") is None
+
+
+def test_time_until_next_refresh_returns_seconds_until_oldest_ages_out():
+    now = [1_000_000.0]
+    acc = PrivacyAccountant(
+        eps_session_max=64.0, eps_user_24h_max=8.0, clock=_mock_clock(now),
+    )
+    acc.consume("s1", "alice", 4.0)            # at t=0
+    now[0] += 3600                              # +1 h
+    acc.consume("s1", "alice", 4.0)            # at t=+1 h
+    # Oldest entry is the first one — it ages out at t+24h, i.e. 23h from now.
+    remaining = acc.time_until_next_refresh("alice")
+    assert remaining == pytest.approx(23 * 3600)
+
+
+def test_time_until_next_refresh_floors_at_zero_when_expired_entries_linger():
+    """Even if we somehow query between an entry's expiry and the next
+    snapshot call, we never return a negative duration."""
+    now = [1_000_000.0]
+    acc = PrivacyAccountant(
+        eps_session_max=64.0, eps_user_24h_max=8.0, clock=_mock_clock(now),
+    )
+    acc.consume("s1", "alice", 4.0)
+    # snapshot() (called inside time_until_next_refresh) prunes expired
+    # entries — push past 24h and the answer must be None (no live entries).
+    now[0] += 24 * 3600 + 10
+    # Force a snapshot to trigger pruning, then check.
+    acc.snapshot("s1", "alice")
+    assert acc.time_until_next_refresh("alice") is None
