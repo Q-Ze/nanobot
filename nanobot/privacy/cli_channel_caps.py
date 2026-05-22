@@ -147,6 +147,6 @@ def _path_label(p: ExecutionPath) -> str:
         ExecutionPath.BLOCKED: "do not send to cloud LLM",
         ExecutionPath.SIMPLE: "answer locally (no cloud call; requires local model — not yet wired)",
         ExecutionPath.METRIC_DP: "send with metric-DP noise (M3, ε-dχ-privacy)",
-        ExecutionPath.K_DECOY: "send k decoys + truth (M2, not yet wired)",
+        ExecutionPath.K_DECOY: "send with HMAC pseudonym from typed pool (M2, no ε cost)",
         ExecutionPath.NORMAL: "send as-is to cloud LLM",
     }.get(p, "")

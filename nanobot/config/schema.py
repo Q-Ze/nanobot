@@ -304,7 +304,13 @@ class PrivacyAuditConfig(Base):
 
 
 class PrivacyKDecoyConfig(Base):
-    """K-decoy parameters (placeholder schema for M2)."""
+    """K-decoy parameters (M2)."""
+
+    enabled: bool = True
+    """When False, K_DECOY is unwired and the decider treats it as
+    unavailable — useful for users who want the formal METRIC_DP
+    guarantee or nothing at all (otherwise MEDIUM PII routes to
+    K_DECOY by default since it doesn't cost ε)."""
 
     k_max: int = Field(default=3, ge=2, le=10)
     allowed_risk: list[Literal["low", "medium"]] = Field(default_factory=lambda: ["low", "medium"])

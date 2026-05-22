@@ -26,6 +26,7 @@ from nanobot.privacy.audit import AuditLogger
 from nanobot.privacy.confirmation import ConfirmationGate
 from nanobot.privacy.decider import DeciderInputs, ExecutionDecider
 from nanobot.privacy.detector import PrivacyEntityDetector
+from nanobot.privacy.k_decoy import KDecoyTransform, resolve_hmac_key
 from nanobot.privacy.local_model import LocalModelBackend
 from nanobot.privacy.local_model import get_default as get_default_backend
 from nanobot.privacy.restorer import Restorer
@@ -58,6 +59,7 @@ class GateKeeper:
         transform: MetricDPTransform | None = None,
         accountant: PrivacyAccountant | None = None,
         restorer: Restorer | None = None,
+        k_decoy: KDecoyTransform | None = None,
         eps_query: float = 8.0,
         local_model_available: bool = False,
         k_decoy_supported: bool = False,
@@ -70,11 +72,12 @@ class GateKeeper:
         self._transform = transform
         self._accountant = accountant
         self._restorer = restorer or Restorer()
+        self._k_decoy = k_decoy
         self._eps_query = float(eps_query)
         self._static_caps = DeciderInputs(
             entities=(),
             local_model_available=local_model_available and self._local_model.is_available(),
-            k_decoy_supported=k_decoy_supported,
+            k_decoy_supported=k_decoy_supported and k_decoy is not None,
             metric_dp_supported=False,  # decided per-call in detect_and_recommend
         )
 
@@ -137,6 +140,28 @@ class GateKeeper:
             )
         restorer = Restorer()
 
+        # M2 wiring — KDecoyTransform doesn't need a backend, so it's
+        # always available as a fallback for METRIC_DP. The HMAC key is
+        # resolved from env / persisted file per the config-specified source.
+        k_decoy_engine: KDecoyTransform | None = None
+        if config.k_decoy.enabled:
+            try:
+                hmac_key = resolve_hmac_key(
+                    source=config.pseudonym_key_source,
+                    fallback_path=str(
+                        Path(config.audit.log_dir).expanduser() / "pseudo_key"
+                    ),
+                )
+                k_decoy_engine = KDecoyTransform(
+                    hmac_key=hmac_key,
+                    k_target=max(2, int(config.k_decoy.k_max)),
+                )
+            except (ValueError, OSError) as exc:
+                # Misconfiguration must not crash the agent loop — fall back
+                # to no K_DECOY path and let the decider pick BLOCKED for MEDIUM.
+                logger.warning("privacy.k_decoy disabled: {}", exc)
+                k_decoy_engine = None
+
         return cls(
             detector=detector,
             decider=decider,
@@ -146,9 +171,10 @@ class GateKeeper:
             transform=transform_engine,
             accountant=accountant,
             restorer=restorer,
+            k_decoy=k_decoy_engine,
             eps_query=config.metric_dp.eps_query,
             local_model_available=False,  # SIMPLE path still unimplemented
-            k_decoy_supported=False,      # M2
+            k_decoy_supported=k_decoy_engine is not None,
         )
 
     # --- pipeline ----------------------------------------------------------------------
@@ -247,7 +273,9 @@ class GateKeeper:
         * METRIC_DP → MetricDPTransform runs; on success consumes ε from
           the accountant and stashes the restoration mapping for
           :meth:`restore` to use later.
-        * SIMPLE / K_DECOY → not implemented; defensively refuse.
+        * K_DECOY → KDecoyTransform runs; deterministic per-session
+          pseudonyms from the typed pool; no ε consumed.
+        * SIMPLE → not implemented; defensively refuse.
         """
         view = self._audit.build_view(decision, decision.recommendation.entities)
         if decision.path == ExecutionPath.BLOCKED:
@@ -307,8 +335,33 @@ class GateKeeper:
                 restoration_plan=restoration_plan,
                 audit_view=new_view,
             )
-        # SIMPLE / K_DECOY or METRIC_DP without engine wired —
-        # defensively refuse rather than silently forwarding plaintext.
+        if decision.path == ExecutionPath.K_DECOY and self._k_decoy is not None:
+            kdr = await self._k_decoy.transform(
+                raw_message,
+                list(decision.recommendation.entities),
+                session_key=session_key,
+            )
+            restoration_plan = {
+                "mapping": dict(kdr.mapping),
+                "failed_entity_types": [e.type.value for e in kdr.failures],
+            }
+            logger.info(
+                "privacy.k_decoy: pseudonymized {} entit{} (K_eff={}); "
+                "{} placeholders for hard-block or empty-pool entities",
+                len(kdr.mapping),
+                "y" if len(kdr.mapping) == 1 else "ies",
+                kdr.k_effective,
+                len(kdr.failures),
+            )
+            new_view = replace(view, fidelity="RESTORED_LOSSY", eps_consumed=0.0)
+            return TransformOutcome(
+                decision=decision,
+                privacy_message=kdr.anonymized_text,
+                restoration_plan=restoration_plan,
+                audit_view=new_view,
+            )
+        # SIMPLE or a path whose engine isn't wired up — defensively refuse
+        # rather than silently forwarding plaintext.
         return TransformOutcome(
             decision=decision,
             privacy_message=(

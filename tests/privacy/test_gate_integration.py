@@ -60,6 +60,17 @@ def _silent_cfg(tmp_path: Path) -> PrivacyConfig:
     return cfg
 
 
+def _metric_dp_only_cfg(tmp_path: Path) -> PrivacyConfig:
+    """Build a config that disables K_DECOY so MEDIUM PII routes to
+    METRIC_DP directly. M2 made K_DECOY the default for MEDIUM (it's
+    free of ε), but several tests below specifically exercise the
+    METRIC_DP pipeline — they'd be hidden by the K_DECOY fast-path
+    otherwise."""
+    cfg = _silent_cfg(tmp_path)
+    cfg.k_decoy.enabled = False
+    return cfg
+
+
 # --- happy path: end-to-end METRIC_DP -------------------------------------------------
 
 
@@ -74,7 +85,7 @@ async def test_full_metric_dp_pipeline_anonymizes_and_restores(tmp_path: Path):
     4) Pretend the cloud LLM echoes the candidate verbatim.
     5) Restorer swaps the candidate back to the user's real address.
     """
-    cfg = _silent_cfg(tmp_path)
+    cfg = _metric_dp_only_cfg(tmp_path)
     # Use high ε so the chosen candidate is the nearest neighbour
     # (alex.morgan@example.com) — gives a deterministic assertion.
     cfg.metric_dp.eps_query = 50.0
@@ -150,7 +161,7 @@ async def test_normal_path_skips_transform_entirely(tmp_path: Path):
 async def test_session_budget_exhaustion_blocks_subsequent_metric_dp(tmp_path: Path):
     """When the accountant runs out of budget mid-session, follow-up METRIC_DP
     requests fall back to BLOCKED instead of forwarding plaintext."""
-    cfg = _silent_cfg(tmp_path)
+    cfg = _metric_dp_only_cfg(tmp_path)
     cfg.metric_dp.eps_query = 8.0
     cfg.metric_dp.eps_session_max = 12.0     # room for exactly one request
     cfg.metric_dp.eps_user_24h_max = 100.0
@@ -175,7 +186,7 @@ async def test_session_budget_exhaustion_blocks_subsequent_metric_dp(tmp_path: P
 @pytest.mark.asyncio
 async def test_user_24h_budget_caps_across_sessions(tmp_path: Path):
     """A user can't reset their daily budget by opening a new session."""
-    cfg = _silent_cfg(tmp_path)
+    cfg = _metric_dp_only_cfg(tmp_path)
     cfg.metric_dp.eps_query = 8.0
     cfg.metric_dp.eps_session_max = 100.0
     cfg.metric_dp.eps_user_24h_max = 10.0     # tighter than the session cap
@@ -199,7 +210,7 @@ async def test_user_24h_budget_caps_across_sessions(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_reset_session_refills_session_budget(tmp_path: Path):
-    cfg = _silent_cfg(tmp_path)
+    cfg = _metric_dp_only_cfg(tmp_path)
     cfg.metric_dp.eps_query = 8.0
     cfg.metric_dp.eps_session_max = 10.0
     cfg.metric_dp.eps_user_24h_max = 100.0
@@ -225,15 +236,33 @@ async def test_reset_session_refills_session_budget(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_no_backend_falls_back_to_blocked_for_medium_pii(tmp_path: Path):
-    """Without a backend, the decider has no METRIC_DP path → MEDIUM blocks."""
+async def test_no_backend_falls_back_to_k_decoy_for_medium_pii(tmp_path: Path):
+    """Without an embedding backend, METRIC_DP is unavailable — but K_DECOY
+    (M2) doesn't need a backend, so MEDIUM PII routes there instead of
+    BLOCKED. The cloud still never sees the raw value."""
     cfg = _silent_cfg(tmp_path)
     gate = GateKeeper.from_config(cfg)   # no local_model
 
     raw = "Email alice@x.com please"
     rec = await gate.detect_and_recommend(raw, session_key="s5", user_id="user-5")
+    assert rec.path == ExecutionPath.K_DECOY
+    assert ExecutionPath.METRIC_DP not in rec.allowed  # truly no METRIC_DP path
+    assert ExecutionPath.BLOCKED in rec.allowed         # user can always escalate
+
+
+@pytest.mark.asyncio
+async def test_no_backend_and_k_decoy_disabled_falls_back_to_blocked(tmp_path: Path):
+    """When the user wants formal guarantees only (METRIC_DP) and has no
+    backend, K_DECOY-disabled is the right way to express that — MEDIUM
+    PII fails closed to BLOCKED instead of silently downgrading."""
+    cfg = _metric_dp_only_cfg(tmp_path)        # K_DECOY off
+    gate = GateKeeper.from_config(cfg)         # no local_model either
+
+    raw = "Email alice@x.com please"
+    rec = await gate.detect_and_recommend(raw, session_key="s5b", user_id="user-5b")
     assert rec.path == ExecutionPath.BLOCKED
     assert ExecutionPath.METRIC_DP not in rec.allowed
+    assert ExecutionPath.K_DECOY not in rec.allowed
 
 
 # --- audit metadata --------------------------------------------------------------------
@@ -241,7 +270,7 @@ async def test_no_backend_falls_back_to_blocked_for_medium_pii(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_audit_view_records_eps_for_metric_dp(tmp_path: Path):
-    cfg = _silent_cfg(tmp_path)
+    cfg = _metric_dp_only_cfg(tmp_path)
     cfg.metric_dp.eps_query = 4.0
     cfg.metric_dp.eps_session_max = 100.0
     cfg.metric_dp.eps_user_24h_max = 100.0
@@ -269,8 +298,12 @@ async def test_blocked_reason_distinguishes_budget_exhaustion(tmp_path: Path):
     budget (transform + backend still functional), the BLOCKED reason
     must include 'eps_budget_exhausted' so the UX doesn't read like
     'feature not implemented'.
+
+    We use the METRIC_DP-only config so K_DECOY doesn't quietly take over
+    when the ε runs out — A1's reason override fires precisely when
+    METRIC_DP is the *only* anonymization path and is denied.
     """
-    cfg = _silent_cfg(tmp_path)
+    cfg = _metric_dp_only_cfg(tmp_path)
     cfg.metric_dp.eps_query = 8.0
     cfg.metric_dp.eps_session_max = 100.0
     cfg.metric_dp.eps_user_24h_max = 8.0    # exactly one query worth
@@ -298,12 +331,121 @@ async def test_blocked_reason_unchanged_when_no_backend(tmp_path: Path):
     """When the *real* cause of BLOCKED is a missing backend (no transform,
     so accountant never even gets consulted), the original
     no_anonymization_path_available_yet reason must be preserved — the
-    A1 override must not falsely accuse the budget."""
-    cfg = _silent_cfg(tmp_path)
-    gate = GateKeeper.from_config(cfg)  # no local_model
+    A1 override must not falsely accuse the budget. K_DECOY also
+    disabled so MEDIUM truly has no anonymization path."""
+    cfg = _metric_dp_only_cfg(tmp_path)  # K_DECOY off
+    gate = GateKeeper.from_config(cfg)   # no local_model either
 
     raw = "Email alice@x.com please"
     rec = await gate.detect_and_recommend(raw, session_key="sY", user_id="user-Y")
     assert rec.path == ExecutionPath.BLOCKED
     assert rec.reason == "no_anonymization_path_available_yet"
     assert "eps_budget_exhausted" not in rec.reason
+
+
+# --- M2 K_DECOY routing ----------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_k_decoy_is_preferred_for_medium_pii_when_available(tmp_path: Path):
+    """The decider prefers K_DECOY > METRIC_DP for MEDIUM. K_DECOY costs
+    no ε, so reserving the budget for HIGH risk is the right default."""
+    cfg = _silent_cfg(tmp_path)
+    gate = GateKeeper.from_config(cfg, local_model=_Backend(_TABLE))
+
+    raw = "Email alice@x.com please"
+    rec = await gate.detect_and_recommend(raw, session_key="sK", user_id="user-K")
+    assert rec.path == ExecutionPath.K_DECOY
+    # Allowed set includes the stricter METRIC_DP as an escalation option.
+    assert ExecutionPath.METRIC_DP in rec.allowed
+    assert ExecutionPath.BLOCKED in rec.allowed
+
+
+@pytest.mark.asyncio
+async def test_k_decoy_end_to_end_does_not_consume_eps(tmp_path: Path):
+    """Full K_DECOY pipeline: detect → confirm → transform → restore.
+    The accountant must show zero ε spent because K_DECOY is free."""
+    cfg = _silent_cfg(tmp_path)
+    cfg.metric_dp.eps_user_24h_max = 16.0   # would be tight if K_DECOY incorrectly spent ε
+    gate = GateKeeper.from_config(cfg, local_model=_Backend(_TABLE))
+
+    raw = "Please email alice@x.com about lunch."
+    rec = await gate.detect_and_recommend(raw, session_key="sK2", user_id="user-K2")
+    assert rec.path == ExecutionPath.K_DECOY
+    decision = await gate.confirm(
+        rec, chat_id="cK", channel_name="cli",
+        capabilities=ChannelCapabilities(),
+    )
+    assert decision.path == ExecutionPath.K_DECOY
+    outcome = await gate.transform(
+        decision, raw, session_key="sK2", user_id="user-K2",
+    )
+    # Cloud should never see the real email.
+    assert "alice@x.com" not in outcome.privacy_message
+    # eps_consumed exactly zero.
+    assert outcome.audit_view.eps_consumed == 0.0
+    # Restoration round-trips.
+    pseudo, original = next(iter(outcome.restoration_plan["mapping"].items()))
+    assert original == "alice@x.com"
+    cloud_reply = f"Got it, drafting an email to {pseudo}."
+    final = await gate.restore(cloud_reply, outcome)
+    assert pseudo not in final
+    assert "alice@x.com" in final
+
+
+@pytest.mark.asyncio
+async def test_k_decoy_survives_metric_dp_budget_exhaustion(tmp_path: Path):
+    """Even after the user burns through all ε on HIGH-risk work, MEDIUM
+    PII can still go via K_DECOY — this is the M2 fallback story.
+
+    Constructed by exhausting the accountant via direct consume(), then
+    sending a MEDIUM email. Without K_DECOY (M1), this would BLOCK; with
+    K_DECOY (M2), the message still gets anonymized."""
+    cfg = _silent_cfg(tmp_path)
+    cfg.metric_dp.eps_user_24h_max = 8.0
+    cfg.metric_dp.eps_query = 8.0
+    gate = GateKeeper.from_config(cfg, local_model=_Backend(_TABLE))
+
+    # Manually exhaust the accountant — simulates a previous HIGH-risk turn.
+    gate._accountant.consume("sK3", "user-K3", 8.0)
+
+    raw = "Email alice@x.com about lunch."
+    rec = await gate.detect_and_recommend(raw, session_key="sK3", user_id="user-K3")
+    # K_DECOY does not consult the accountant — still available.
+    assert rec.path == ExecutionPath.K_DECOY
+    decision = await gate.confirm(
+        rec, chat_id="cK3", channel_name="cli",
+        capabilities=ChannelCapabilities(),
+    )
+    outcome = await gate.transform(
+        decision, raw, session_key="sK3", user_id="user-K3",
+    )
+    assert "alice@x.com" not in outcome.privacy_message
+    assert outcome.audit_view.eps_consumed == 0.0
+
+
+@pytest.mark.asyncio
+async def test_k_decoy_pseudonyms_consistent_within_session(tmp_path: Path):
+    """A second turn referencing the same entity must yield the same
+    pseudonym so the cloud's multi-turn reasoning stays coherent.
+
+    This exercises the deterministic HMAC keying end-to-end (not just
+    in the unit test for KDecoyTransform)."""
+    cfg = _silent_cfg(tmp_path)
+    gate = GateKeeper.from_config(cfg, local_model=_Backend(_TABLE))
+
+    raw1 = "Email alice@x.com tomorrow."
+    raw2 = "Also CC alice@x.com on the previous email."
+    rec1 = await gate.detect_and_recommend(raw1, session_key="sK4", user_id="user-K4")
+    d1 = await gate.confirm(rec1, chat_id="cK4", channel_name="cli",
+                            capabilities=ChannelCapabilities())
+    o1 = await gate.transform(d1, raw1, session_key="sK4", user_id="user-K4")
+
+    rec2 = await gate.detect_and_recommend(raw2, session_key="sK4", user_id="user-K4")
+    d2 = await gate.confirm(rec2, chat_id="cK4", channel_name="cli",
+                            capabilities=ChannelCapabilities())
+    o2 = await gate.transform(d2, raw2, session_key="sK4", user_id="user-K4")
+
+    p1 = next(iter(o1.restoration_plan["mapping"]))
+    p2 = next(iter(o2.restoration_plan["mapping"]))
+    assert p1 == p2, "deterministic pseudonym must be stable across turns of the same session"

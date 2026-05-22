@@ -117,13 +117,18 @@ return Recommendation(path=rec, allowed=allowed, reason=...)
 ### 3.3 PrivacyTransformer
 
 #### 3.3.1 K-Decoy（重命名以避免与表格型 k-匿名混淆）
-- 用端侧小模型按实体类型从相同分布生成 `k-1` 条诱饵消息。
-- 诱饵生成约束：
-  1. 与真实消息共享句法骨架（同问句结构、同任务意图）；
-  2. 诱饵中的隐私实体在条件熵上与真实实体不可区分（用相同 domain prior 采样）；
-  3. 不含与真实消息可关联的指纹（拼写习惯、罕见词同时出现等）。
-- **保证强度**：对计算受限的半诚实云端，无背景知识时区分器优势 ≤ 1/k − 1/2 + ε_dist；持有语言先验时优势随上下文长度增长而退化。**不是无条件 k-匿名**。
-- **使用约束**：禁止用于 HIGH 风险类，禁止用于 RECURRENT_CROSS_SESSION 实体。
+
+**M2 v1 简化版（已实现，2026-05）**：原方案的"端侧小模型生成 k-1 条诱饵消息 + 多轮发送"工程代价过高，且与 §5.1 的 AgentRunner 单消息约束冲突（cron / tool call 不能并发 K 次）。落地版采用"单消息 pseudonym 替换 + typed pool 作为隐式匿名集"：
+
+- 对每个检测到的 entity，从 `EntityType -> List[str]` 的 typed pool 中按 `idx = HMAC_SHA256(deployment_key, session_key‖type‖canonical(value)) mod len(pool)` 选取一个 pseudonym 替换。
+- **K_effective = pool size**（减去原值后剩余条数）。云端只见到单个 pseudonym；从云端视角看，该 pseudonym 等概率对应 pool 中任意一条同类型的真实值。
+- pool 的来源：默认与 `MetricDPTransform` 共享 `_DEFAULT_POOLS`；用户可在 config 中覆盖以引入更大、更贴合自身领域的诱饵集合。
+- 同 (session_key, value) → 同 pseudonym（多轮对话连贯）；不同 session → 不同 pseudonym（HMAC 跨会话不可链接）。
+- **保证强度**：对计算受限、无先验的半诚实云端，区分器优势 ≤ 1/K_effective − 1/2 + adv(prior)；持有上下文语言先验时优势随轮次增长而退化。**不是无条件 k-匿名**。
+- **与 METRIC_DP 的关系**：K_DECOY 不消耗 ε、不调用 embedding 模型；适合 ε 预算耗尽或 backend 不可用时的 fallback。提供的隐私保证严格弱于 METRIC_DP（无形式化 dχ-privacy），但好于 NORMAL（云端永远见不到原值）。
+- **使用约束**：HARD_BLOCK_TYPES（KEY_MATERIAL / CREDENTIAL / JWT / INTERNAL_INSTRUCTION）由 decider 优先拦截到 BLOCKED；KDecoyTransform 自身对未注册 pool 或 pool 大小 < 2 的 entity 类型 fall back 到 `[<TYPE>_REDACTED]` placeholder，防御性退化。
+
+**原方案的多消息 K-decoy（保留作为 v2 候选）**：真正发出 K 条并行查询、丢弃 K-1 条响应、拦截 decoy 路径的 tool call。工程代价 3-5x，需重构 AgentRunner 支持并行 cloud call + decoy 抑制。当 v1 在用户反馈中暴露"隐式匿名集太弱"时再升级。
 
 #### 3.3.2 Metric DP on Token Embeddings（替代 "LDP"）
 - 形式化：机制 M 是 ε-dχ-private（参考 Andrés et al. 2013；Feyisetan et al. WSDM 2020 MADLIB/SANTEXT）当且仅当对任意 x, x' 与任意输出集合 S：
@@ -375,7 +380,7 @@ confirmation:
 | BLOCKED | 信息不出域 | ✅ shipped (M1) | 端侧不被攻陷 |
 | SIMPLE | 信息不出域 | ⚠️ 接口存在，路径默认禁用（`local_model_available=False`） | 同上 |
 | METRIC_DP | (ε)-dχ-privacy on transformed tokens；(ε_session, ε_user_24h) 由 PrivacyAccountant 强制；超预算 fail-closed | ✅ shipped (M3) — 已经实测真实 OpenAI embedding | 攻击者无端侧密钥；候选池 embedding 与原 token 共享同一 embedding model；Laplace 采样器实现正确（经验证：与理论 Gamma(d, 1/ε) 矩匹配，dχ-privacy 经验边界通过）；最近邻投影是后处理 |
-| K_DECOY | 计算性可否认：单条消息上区分器优势 ≤ 1/k − 1/2 + adv(prior) | ⏳ 未实现（M2，已降级为可选 fast-path） | 攻击者多项式时间；诱饵分布与真实分布 TV 距离小；无跨轮重复 |
+| K_DECOY | 计算性可否认：单条消息上区分器优势 ≤ 1/K_effective − 1/2 + adv(prior) | ✅ shipped (M2 v1) — pseudonym + typed pool 隐式匿名集 | 攻击者多项式时间且无强先验；HMAC 密钥未泄漏；K_effective = pool size − 1 |
 | NORMAL | **无保护**（按定义） | ✅ shipped (M1) | 已判定无隐私实体；接受路由侧信道 |
 
 **M3 实测验证（2026-05-12）**：
@@ -398,7 +403,7 @@ confirmation:
 - **M1** ✅ shipped — 检测器（正则）+ 决策器（推荐 + AllowedSet）+ ConfirmationGate（三种 mode、超时、channel fallback）+ BLOCKED + NORMAL + 审计记录。
 - **M1.5** ✅ shipped — SIMPLE stub 收口；`LocalModelBackend` 抽象 + `LLMProviderBackend` 适配器；CLI + WebSocket 交互确认；`local_model` 通过现有 `providers.*` 注册表；`LLMSemanticDetector` 自动 wire；`OpenAICompatProvider.embed` + 非规范 JSON httpx fallback。
 - **M3** ✅ shipped — Multivariate Laplace 采样器 + token-level dχ-privacy `MetricDPTransform` + `PrivacyAccountant`（(ε_session, ε_user_24h) + 滑动窗口 + 持久化）+ `Restorer`（两段 sentinel 替换）+ GateKeeper / AgentLoop 端到端集成（含决策器 metric_dp_supported 动态判断）。已对真实 OpenAI embedding（经 OpenRouter）端到端验证。
-- **M2** 未开始 — 伪名层（HMAC-SHA256 with session key）+ K_DECOY 诱饵生成 + accountant 与 M3 共享。**降级为"可选 fast-path"**：原设计把 K-decoy 看作"少 ε 时的备选"，但实际 Metric-DP 提供更强保证，绝大多数用户应优先用 M3。
+- **M2** ✅ shipped (v1) — `KDecoyTransform` 实现 HMAC-pseudonym + typed pool 隐式匿名集；HMAC 密钥从 `NANOBOT_PRIVACY_KEY` env / `~/.nanobot/privacy_audit/pseudo_key` 文件解析（缺失时自动生成 32 字节随机密钥并 0600 持久化）；K_DECOY 与 METRIC_DP 共享 typed pool；K_DECOY 不消耗 ε、不需 embedding，自然作为 METRIC_DP 预算耗尽时的 fallback。多消息 K-decoy（真正并行 K 条云端调用）保留作为 v2 候选。
 - **M4** 未开始 — 路由侧信道缓解（`routing_mode: balanced` + cover-traffic randomisation）；信封加密审计（KMS / age recipient 已留 `audit.kms_recipient` 配置位）；工具输出 PII 扫描（agent 读取的文件/MCP/web fetch 当前都直接出云）；MyTool 自修改防护。
 - **WebUI** 未开始 — 渲染 `privacy_confirmation` envelope 弹窗。协议侧已就绪 + 测试覆盖；纯前端 PR。
 

@@ -98,15 +98,21 @@ async def test_gatekeeper_facade_passes_low_risk(tmp_path: Path):
     assert outcome.privacy_message == "Hello, how are you today?"
 
 
-async def test_gatekeeper_blocks_medium_pii_in_m1(tmp_path: Path):
-    """M1 has no K_DECOY/METRIC_DP wired, so any MEDIUM entity → BLOCKED."""
+async def test_gatekeeper_routes_medium_pii_to_k_decoy_in_m2(tmp_path: Path):
+    """M2 shipped K_DECOY, which the decider prefers over METRIC_DP for MEDIUM
+    entities (saves the ε budget for HIGH risk). Email is MEDIUM, so the
+    recommendation should be K_DECOY — not BLOCKED (M1 default) nor
+    METRIC_DP (which the decider holds in reserve)."""
     cfg = PrivacyConfig(enabled=True)
     cfg.audit.log_dir = str(tmp_path)
     # Confirmation off so we observe the system recommendation directly.
     cfg.confirmation.mode = "never"
     gate = GateKeeper.from_config(cfg)
     rec = await gate.detect_and_recommend("Email me at alice@example.com")
-    assert rec.path == ExecutionPath.BLOCKED
+    assert rec.path == ExecutionPath.K_DECOY
+    # BLOCKED and METRIC_DP-when-available should both be in the allowed
+    # set so the user can escalate via the confirmation prompt.
+    assert ExecutionPath.BLOCKED in rec.allowed
 
 
 async def test_restore_is_identity_for_m1_paths(tmp_path: Path):
@@ -132,16 +138,19 @@ async def test_simple_path_is_not_exposed_in_m1_5(tmp_path: Path):
 
 
 async def test_transform_refuses_unimplemented_paths(tmp_path: Path):
-    """Defensive: if a non-NORMAL/BLOCKED path somehow reaches transform, refuse."""
+    """Defensive: SIMPLE has no implementation. If it somehow reaches
+    transform (a buggy decider override, a future config), refuse rather
+    than silently forward plaintext. K_DECOY and METRIC_DP now have
+    transforms, so they're no longer the canary here."""
     cfg = PrivacyConfig(enabled=True)
     cfg.audit.log_dir = str(tmp_path)
     gate = GateKeeper.from_config(cfg)
     rec = Recommendation(
-        path=ExecutionPath.K_DECOY,
-        allowed=frozenset({ExecutionPath.K_DECOY, ExecutionPath.BLOCKED}),
+        path=ExecutionPath.SIMPLE,
+        allowed=frozenset({ExecutionPath.SIMPLE, ExecutionPath.BLOCKED}),
         reason="t",
         entities=(_entity(),),
     )
-    decision = Decision(path=ExecutionPath.K_DECOY, source=PathSource.SYSTEM_AUTO, recommendation=rec)
+    decision = Decision(path=ExecutionPath.SIMPLE, source=PathSource.SYSTEM_AUTO, recommendation=rec)
     outcome = await gate.transform(decision, "raw text")
     assert "not implemented" in outcome.privacy_message.lower()
